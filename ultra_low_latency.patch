@@ -1,0 +1,172 @@
+ --- ffmpeg-6.1.1/libavformat/rtpdec.c.orig
++++ ffmpeg-6.1.1/libavformat/rtpdec.c
+@@ -xxx,x +xxx,x @@
++// 全局变量用于标记帧结束
++int mark_flag = 0;
++
+ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
+                                      const uint8_t *buf, int len)
+ {
+     ......
+  
+     if (buf[1] & 0x80)
+         flags |= RTP_FLAG_MARKER;
++    //the end of a frame - 关键修改点1
++    mark_flag = flags;
+  
+     ......
+ }
+
+--- ffmpeg-6.1.1/libavformat/utils.c.orig
++++ ffmpeg-6.1.1/libavformat/utils.c
+@@ -xxx,x +xxx,x @@
+ static int parse_packet(AVFormatContext *s, AVPacket *pkt, int stream_index)
+ {
+     ......
+  
+-//    while (size > 0 || (pkt == &flush_pkt && got_output)) {
++    // 去掉while循环，直接处理单帧 - 关键修改点2  
+         int len;
+         int64_t next_pts = pkt->pts;
+         int64_t next_dts = pkt->dts;
+  
+         av_init_packet(&out_pkt);
+         len = av_parser_parse2(st->parser, st->internal->avctx,
+                                &out_pkt.data, &out_pkt.size, data, size,
+                                pkt->pts, pkt->dts, pkt->pos);
+         pkt->pts = pkt->dts = AV_NOPTS_VALUE;
+         pkt->pos = -1;
+         /* increment read pointer */
+         data += len;
+         size -= len;
+  
+         got_output = !!out_pkt.size;
+  
+         if (!out_pkt.size){
+             av_packet_unref(&out_pkt);//release current packet
+             av_packet_unref(pkt);//release current packet
+             return 0;
+-//            continue;
+         }
+     ......        
+    
+         ret = add_to_pktbuf(&s->internal->parse_queue, &out_pkt,
+                             &s->internal->parse_queue_end, 1);
+         av_packet_unref(&out_pkt);
+         if (ret < 0)
+             goto fail;
+-//    }
+  
+     /* end of the stream => close and free the parser */
+     if (pkt == &flush_pkt) {
+         av_parser_close(st->parser);
+         st->parser = NULL;
+     }
+  
+ fail:
+     av_packet_unref(pkt);
+     return ret;
+ }
+
+--- ffmpeg-6.1.1/libavcodec/parser.c.orig
++++ ffmpeg-6.1.1/libavcodec/parser.c
+@@ -xxx,x +xxx,x @@
++extern int mark_flag;//引用全局变量
++
+ int av_parser_parse2(AVCodecParserContext *s, AVCodecContext *avctx,
+                      uint8_t **poutbuf, int *poutbuf_size,
+                      const uint8_t *buf, int buf_size,
+                      int64_t pts, int64_t dts, int64_t pos)
+ {
+     ......
+  
+     /* WARNING: the returned index can be negative */
+     index = s->parser->parser_parse(s, avctx, (const uint8_t **) poutbuf,
+                                     poutbuf_size, buf, buf_size);
+     av_assert0(index > -0x20000000); // The API does not allow returning AVERROR codes
+ #define FILL(name) if(s->name > 0 && avctx->name <= 0) avctx->name = s->name
+     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+         FILL(field_order);
+     }
+  
+     /* update the file pointer */
+     if (*poutbuf_size) {
+         /* fill the data for the current frame */
+         s->frame_offset = s->next_frame_offset;
+  
+         /* offset of the next frame */
+-//        s->next_frame_offset = s->cur_offset + index;
+-        //video frame don't plus index
++        // 视频帧不增加index偏移 - 关键修改点3
+         if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+             s->next_frame_offset = s->cur_offset;
+         }else{
+             s->next_frame_offset = s->cur_offset + index;
+         }
+         s->fetch_timestamp   = 1;
+     }
+     if (index < 0)
+         index = 0;
+     s->cur_offset += index;
+     return index;
+ }
+
+ int ff_combine_frame(ParseContext *pc, int next,const uint8_t **buf, int *buf_size)
+ {
+     ......
+  
+     /* copy into buffer end return */
+-//    if (next == END_NOT_FOUND) {
++    // 使用mark标志替代帧起始码判断 - 关键修改点4
+         void *new_buffer = av_fast_realloc(pc->buffer, &pc->buffer_size,
+                                            *buf_size + pc->index +
+                                            AV_INPUT_BUFFER_PADDING_SIZE);
+  
+         if (!new_buffer) {
+           
+             pc->index = 0;
+             return AVERROR(ENOMEM);
+         }
+         pc->buffer = new_buffer;
+         memcpy(&pc->buffer[pc->index], *buf, *buf_size);
+         pc->index += *buf_size;
+-//        return -1;
++        // 基于mark标志判断帧结束
+           if(!mark_flag)
+             return -1;
+         next = 0;
+-//    }
+  
+     ......
+  
+ }
+
+--- ffmpeg-6.1.1/libavcodec/h264_parser.c.orig
++++ ffmpeg-6.1.1/libavcodec/h264_parser.c
+@@ -xxx,x +xxx,x @@
+ static int h264_parse(AVCodecParserContext *s,
+                       AVCodecContext *avctx,
+                       const uint8_t **poutbuf, int *poutbuf_size,
+                       const uint8_t *buf, int buf_size)
+ {
+     ......
+  
+     if (s->flags & PARSER_FLAG_COMPLETE_FRAMES) {
+         next = buf_size;
+     } else {
+-//TODO:don't use next frame start code, modify by xufulong
+-//        next = h264_find_frame_end(p, buf, buf_size, avctx);
++        // 不使用下一帧起始码，直接组帧 - 关键修改点5
+         if (ff_combine_frame(pc, next, &buf, &buf_size) < 0) {
+             *poutbuf      = NULL;
+             *poutbuf_size = 0;
+             return buf_size;
+         }
+-/*        if (next < 0 && next != END_NOT_FOUND) {
+-            av_assert1(pc->last_index + next >= 0);
+-            h264_find_frame_end(p, &pc->buffer[pc->last_index + next], -next, avctx); // update state
+-        }*/
++        // 移除状态更新逻辑
+     }
+     ......
+ }
