@@ -401,7 +401,8 @@ public class MainActivity extends AppCompatActivity {
             rtspPlayer.stopRecording();
         } else {
             // 开始录制
-            final String outputPath = Environment.getExternalStorageDirectory() + 
+            File storage = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+            final String outputPath =  storage.getAbsolutePath() + "/record" +
                               "/rtsp_record_" + System.currentTimeMillis() + ".mp4";
             
             rtspPlayer.startRecording(outputPath);
@@ -476,6 +477,8 @@ public class MainActivity extends AppCompatActivity {
             logScrollView.post(() -> logScrollView.fullScroll(View.FOCUS_DOWN));
         }
     }
+    
+    // 移除Activity生命周期绑定 - 改为纯Surface状态管理
 
     @Override
     protected void onDestroy() {
@@ -498,6 +501,9 @@ public class MainActivity extends AppCompatActivity {
         if (executorService != null && !executorService.isShutdown()) {
             executorService.shutdown();
         }
+        
+        // 最终清理Surface
+        setSurface(null);
     }
 
     @Override
@@ -754,4 +760,7 @@ public class MainActivity extends AppCompatActivity {
      * @param surface Surface对象，用于显示视频
      */
     public native void setSurface(Surface surface);
+    
+    // 移除Activity生命周期native方法 - 改为纯Surface状态管理
+
 }

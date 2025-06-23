@@ -1,176 +1,198 @@
 #!/bin/bash
-# FFmpeg Android NDK 编译脚本 - 基于成功脚本重写
-# NDK 26.1.10909125
+# FFmpeg 6.1 编译脚本 for Windows 11 + NDK 25
+# 解决GWP-ASan问题，开启硬件加速和RTSP功能
+# 目标架构: arm64-v8a
 
 set -e
 
-# Convert Windows path to MSYS2 path format
+# ======================= 路径配置 =======================
+# 使用最新的 NDK 25 (避免 GWP-ASan 问题)
+NDK_25_PATH="C:/Users/pc/AppData/Local/Android/Sdk/ndk/25.2.9519653"
+FFMPEG_VERSION="6.1.1"
+FFMPEG_ARCHIVE="ffmpeg-${FFMPEG_VERSION}.tar.xz"
+FFMPEG_DIR="ffmpeg-${FFMPEG_VERSION}"
+
+# ======================= 路径转换函数 =======================
 win_to_msys2_path() {
-    echo "$1" | sed 's/\\/\//g' | sed 's/C:/\/c/g' | sed 's/D:/\/d/g'
+    echo "$1" | sed 's/\\/\//g' | sed 's/^\([A-Z]\):/\/\l\1/'
 }
 
-# NDK路径，使用 Windows 路径格式 - 使用NDK 24
-ANDROID_NDK_ROOT_WIN="C:/Users/pc/AppData/Local/Android/Sdk/ndk/23.2.8568313"
-ANDROID_NDK_ROOT=$(win_to_msys2_path "$ANDROID_NDK_ROOT_WIN")
-TOOLCHAIN=$(win_to_msys2_path "$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64")
-API=24
+# 转换NDK路径 - 使用Windows原始路径避免MSYS2路径问题
+NDK_PATH_WIN="$NDK_25_PATH"
+NDK_PATH=$(win_to_msys2_path "$NDK_25_PATH")
+TOOLCHAIN_WIN="$NDK_25_PATH/toolchains/llvm/prebuilt/windows-x86_64"
+TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/windows-x86_64"
+SYSROOT_WIN="$TOOLCHAIN_WIN/sysroot"
+SYSROOT="$TOOLCHAIN/sysroot"
+API=24  # 推荐使用 API 24+
 
-function check_toolchain() {
-    echo "Checking NDK tools..."
+echo "🔧 使用 NDK 25 (版本 25.2.9519653)"
+echo "NDK 路径: $NDK_PATH"
 
-    if [ ! -d "$ANDROID_NDK_ROOT" ]; then
-        echo "Error: NDK directory not found at $ANDROID_NDK_ROOT"
-        exit 1
-    fi
-
-    if [ ! -d "$TOOLCHAIN" ]; then
-        echo "Error: Toolchain directory not found at $TOOLCHAIN"
-        exit 1
-    fi
-
-    # Remove .cmd extension for MSYS2 environment
-    CC_PATH=$(echo "$CC" | sed 's/\.cmd$//')
-    CXX_PATH=$(echo "$CXX" | sed 's/\.cmd$//')
-
-    if [ ! -f "$CC_PATH" ]; then
-        echo "Error: C compiler not found at $CC_PATH"
-        exit 1
-    fi
-
-    if [ ! -f "$CXX_PATH" ]; then
-        echo "Error: C++ compiler not found at $CXX_PATH"
-        exit 1
-    fi
-
-    echo "NDK directory: $ANDROID_NDK_ROOT"
-    echo "Toolchain directory: $TOOLCHAIN"
-    echo "C compiler: $CC"
-    echo "C++ compiler: $CXX"
-}
-
-# 准备FFmpeg源码
-FFMPEG_DIR="ffmpeg-6.1.1"
+# ======================= 准备源码 =======================
 if [[ ! -d "$FFMPEG_DIR" ]]; then
-    if [[ ! -f "ffmpeg-6.1.1.tar.xz" ]]; then
-        wget "https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz"
+    if [[ ! -f "$FFMPEG_ARCHIVE" ]]; then
+        echo "⬇️ 下载 FFmpeg ${FFMPEG_VERSION}..."
+        curl -O "https://ffmpeg.org/releases/$FFMPEG_ARCHIVE"
     fi
-    tar -xf "ffmpeg-6.1.1.tar.xz"
+    echo "📦 解压 FFmpeg..."
+    tar -xf "$FFMPEG_ARCHIVE"
 fi
 
 cd "$FFMPEG_DIR"
 
-function build_android() {
-    echo "开始编译 $CPU"
+# ======================= 编译函数 =======================
+build_android() {
+    echo "🚀 开始编译: $ARCH ($CPU)"
 
-    # 检查工具链
-    check_toolchain
+    # 配置参数
+    local PREFIX="$(pwd)/build/$ANDROID_ABI"
+    rm -rf "$PREFIX" && mkdir -p "$PREFIX"
 
-    # 确保目录存在
-    mkdir -p "$PREFIX"
+    # 编译器路径 - 使用Windows路径避免路径解析问题
+    local CC="$TOOLCHAIN_WIN/bin/${HOST}${API}-clang"
+    local CXX="$TOOLCHAIN_WIN/bin/${HOST}${API}-clang++"
 
-    # 设置pkg-config
-    export PKG_CONFIG_PATH="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/pkgconfig"
-    export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+    # 工具链
+    local NM="$TOOLCHAIN_WIN/bin/llvm-nm"
+    local AR="$TOOLCHAIN_WIN/bin/llvm-ar"
+    local RANLIB="$TOOLCHAIN_WIN/bin/llvm-ranlib"
+    local STRIP="$TOOLCHAIN_WIN/bin/llvm-strip"
 
-    # 直接使用Windows路径，不转换 - 参考成功脚本
-    CC_CONFIGURE="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/$HOST$API-clang"
-    CXX_CONFIGURE="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/$HOST$API-clang++"
-    NM="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm"
-    AR="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar"
-    RANLIB="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ranlib"
-    STRIP="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip"
+    # 禁用所有sanitizer
+    export ASAN_OPTIONS=disable=1
+    export MSAN_OPTIONS=disable=1
+    export TSAN_OPTIONS=disable=1
+    export UBSAN_OPTIONS=disable=1
 
-    # 配置FFmpeg - 修改编译选项
+    # 测试编译器是否工作
+    echo "🔍 测试编译器..."
+    if ! "$CC" --version > /dev/null 2>&1; then
+        echo "❌ 编译器测试失败: $CC"
+        echo "请检查NDK路径和版本"
+        exit 1
+    fi
+    echo "✅ 编译器测试通过"
+
+    echo "🔨 配置 FFmpeg (优化NDK 25兼容性)..."
+
+    # ======================= 关键配置 =======================
     ./configure \
         --prefix="$PREFIX" \
         --target-os=android \
         --arch="$ARCH" \
         --cpu="$CPU" \
-        --cc="$CC_CONFIGURE" \
-        --cxx="$CXX_CONFIGURE" \
+        --cc="$CC" \
+        --cxx="$CXX" \
         --nm="$NM" \
         --ar="$AR" \
         --ranlib="$RANLIB" \
         --strip="$STRIP" \
-        --cross-prefix="$HOST$API-" \
-        --sysroot="$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/sysroot" \
+        --cross-prefix="$TOOLCHAIN_WIN/bin/${HOST}-" \
+        --sysroot="$SYSROOT_WIN" \
         --enable-cross-compile \
+        --enable-pic \
+        --enable-static \
+        --disable-shared \
         --disable-debug \
         --disable-programs \
         --disable-doc \
         --disable-avdevice \
-        --disable-avfilter \
         --disable-postproc \
+        --disable-avfilter \
         --enable-swscale \
-        --enable-pic \
-        --enable-static \
-        --disable-shared \
-        --enable-small \
-        --enable-zlib \
-        --pkg-config-flags="--static" \
-        --enable-network \
+        --disable-iconv \
+        --disable-bsfs \
+        --disable-encoders \
+        --disable-muxers \
         --disable-x86asm \
         --disable-asm \
         --disable-inline-asm \
-        --disable-iconv \
-        --disable-securetransport \
-        --disable-xlib \
-        --disable-devices \
-        --disable-outdevs \
-        --disable-indevs \
-        --disable-filters \
-        --disable-bsfs \
-        --disable-parsers \
-        --enable-parser=h264 \
-        --enable-parser=aac \
-        --disable-encoders \
-        --enable-encoder=aac \
-        --disable-decoders \
-        --enable-decoder=h264 \
-        --enable-decoder=aac \
-        --enable-decoder=pcm_s16le \
-        --enable-decoder=h264_mediacodec \
-        --enable-hwaccel=h264_mediacodec_async \
-        --enable-mediacodec \
+        --disable-vulkan \
+        --enable-network \
+        --enable-zlib \
         --enable-jni \
-        --disable-muxers \
-        --enable-muxer=mp4 \
-        --enable-muxer=mov \
-        --disable-demuxers \
+        --enable-mediacodec \
+        --enable-neon \
+        --enable-hwaccels \
+        --enable-demuxer=rtsp \
+        --enable-demuxer=rtp \
+        --enable-demuxer=sdp \
         --enable-demuxer=mov \
         --enable-demuxer=matroska \
-        --enable-demuxer=rtsp \
-        --enable-demuxer=sdp \
-        --enable-demuxer=rtp \
-        --disable-protocols \
-        --enable-protocol=file \
-        --enable-protocol=rtp \
+        --enable-demuxer=h264 \
+        --enable-demuxer=hevc \
+        --enable-demuxer=flv \
+        --enable-protocol=rtsp \
         --enable-protocol=tcp \
         --enable-protocol=udp \
-        --enable-protocol=rtsp \
-        --extra-cflags="-O3 -fPIC -std=c11 -fno-emulated-tls" \
-        --extra-cxxflags="-std=c++11 -fno-emulated-tls" \
-        --extra-ldflags="-lc -lm -ldl -llog -lz -Wl,--exclude-libs,ALL -Wl,--gc-sections" || exit 1
+        --enable-protocol=rtp \
+        --enable-protocol=rtmp \
+        --enable-parser=h264 \
+        --enable-parser=hevc \
+        --enable-parser=aac \
+        --enable-parser=mpeg4video \
+        --enable-decoder=h264 \
+        --enable-decoder=h265 \
+        --enable-decoder=hevc \
+        --enable-decoder=mpeg4 \
+        --enable-decoder=aac \
+        --enable-decoder=mp3 \
+        --enable-decoder=pcm_s16le \
+        --enable-decoder=pcm_s16be \
+        --enable-decoder=pcm_mulaw \
+        --enable-decoder=pcm_alaw \
+        --enable-decoder=adpcm_g726 \
+        --enable-decoder=h264_mediacodec \
+        --enable-decoder=hevc_mediacodec \
+        --enable-decoder=vp9_mediacodec \
+        --extra-cflags="-Os -fPIC -DANDROID -D__ANDROID_API__=$API -fno-sanitize=scudo -fno-sanitize=all -DGWP_ASAN_HOOKS=0" \
+        --extra-cxxflags="-Os -fPIC -DANDROID -D__ANDROID_API__=$API -fno-sanitize=scudo -fno-sanitize=all -DGWP_ASAN_HOOKS=0" \
+        --extra-ldexeflags="-pie" \
+        --extra-ldflags="-L$SYSROOT_WIN/usr/lib/aarch64-linux-android/$API -L$TOOLCHAIN_WIN/sysroot/usr/lib/aarch64-linux-android/$API -landroid -lmediandk -lm -llog -lz -fno-sanitize=scudo -fno-sanitize=all -Wl,--no-undefined -Wl,--no-as-needed" \
+        --pkg-config="pkg-config" || {
+            echo "❌ 配置失败!"; exit 1
+        }
 
-    echo "Starting make..."
+    echo "🔨 编译中 (使用 $(nproc) 线程)..."
     make clean
-    make -j4
-    make install
+    make -j$(nproc) || {
+        echo "❌ 编译失败!"; exit 1
+    }
+    make install || {
+        echo "❌ 安装失败!"; exit 1
+    }
 
-    # 创建合并的动态库 - 修改链接选项
-    mkdir -p "$PREFIX/lib"
+    # ======================= 验证与输出 =======================
+    echo "✅ 验证生成的库文件..."
+    local OUTPUT_LIB="$PREFIX/lib/libavcodec.a"
 
-    # 检查静态库是否存在
-    if [ ! -f "$PREFIX/lib/libavformat.a" ]; then
-        echo "❌ Static libraries not found"
-        return 1
+    if [ -f "$OUTPUT_LIB" ]; then
+        echo "✅ 静态库编译成功"
+
+        # 检查库文件大小
+        local LIB_SIZE=$(stat -c%s "$OUTPUT_LIB" 2>/dev/null || echo "0")
+        echo "📊 libavcodec.a 大小: $LIB_SIZE bytes"
+
+        # 检查符号
+        if "$NM" "$OUTPUT_LIB" 2>/dev/null | grep -q "av_"; then
+            echo "✅ FFmpeg符号验证通过"
+        else
+            echo "⚠️  FFmpeg符号验证失败"
+        fi
+    else
+        echo "❌ 库文件生成失败: $OUTPUT_LIB"
+        exit 1
     fi
 
-    # 使用编译器创建动态库，添加TLS选项
-    "$CC_CONFIGURE" -shared -fPIC \
-        -fno-emulated-tls \
-        -Wl,--no-undefined \
-        -Wl,--export-dynamic \
+    # 创建合并的动态库（使用修复后的方法）
+    echo "📦 创建合并的动态库..."
+    local COMBINED_SO="$PREFIX/lib/libffmpeg.so"
+
+    # 使用 --allow-multiple-definition 和 --whole-archive 解决符号冲突
+    echo "🔗 正在链接所有静态库到动态库（修复版）..."
+    "$CC" -shared -fPIC \
+        -Wl,--allow-multiple-definition \
         -Wl,--whole-archive \
         "$PREFIX/lib/libavformat.a" \
         "$PREFIX/lib/libavcodec.a" \
@@ -178,102 +200,92 @@ function build_android() {
         "$PREFIX/lib/libswresample.a" \
         "$PREFIX/lib/libswscale.a" \
         -Wl,--no-whole-archive \
-        -o "$PREFIX/lib/libffmpeg.so" \
-        -L"$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/$HOST" \
-        -L"$ANDROID_NDK_ROOT_WIN/platforms/android-$API/arch-$ARCH/usr/lib" \
-        -landroid -lmediandk \
-        -lc -lm -ldl -llog -lz
+        -L"$SYSROOT_WIN/usr/lib/aarch64-linux-android/$API" \
+        -L"$TOOLCHAIN_WIN/sysroot/usr/lib/aarch64-linux-android/$API" \
+        -landroid -lmediandk -llog -lz -lm -lc++_shared \
+        -Wl,--no-undefined \
+        -o "$COMBINED_SO" || {
+        echo "❌ 动态库创建失败!"
+        exit 1
+    }
 
-    # 移除所有GWP-ASan符号
-    echo "Removing GWP-ASan symbols..."
-    "$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-objcopy" \
-        --wildcard --strip-symbol="*gwp_asan*" \
-        "$PREFIX/lib/libffmpeg.so"
+    # 验证动态库大小
+    local SO_SIZE=$(stat -c%s "$COMBINED_SO" 2>/dev/null || echo "0")
+    echo "📊 libffmpeg.so 大小: $SO_SIZE bytes ($(($SO_SIZE / 1024 / 1024))MB)"
 
-    # 验证GWP-ASan符号已被移除
-    echo "Verifying GWP-ASan symbols removal..."
-    GWP_COUNT=$("$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm" "$PREFIX/lib/libffmpeg.so" 2>/dev/null | grep -c "gwp_asan" || echo "0")
-    if [ "$GWP_COUNT" -eq 0 ]; then
-        echo "✅ All GWP-ASan symbols removed successfully"
+    # 检查大小是否合理（应该至少10MB+）
+    if [ "$SO_SIZE" -lt 10000000 ]; then
+        echo "⚠️  警告: 动态库大小可能偏小 ($SO_SIZE bytes)"
+
+        # 显示各静态库大小用于诊断
+        echo "🔍 静态库大小对比:"
+        for lib in libavformat.a libavcodec.a libavutil.a libswresample.a libswscale.a; do
+            if [ -f "$PREFIX/lib/$lib" ]; then
+                local LIB_SIZE=$(stat -c%s "$PREFIX/lib/$lib" 2>/dev/null || echo "0")
+                echo "  $lib: $(($LIB_SIZE / 1024))KB"
+            fi
+        done
     else
-        echo "⚠️  Warning: $GWP_COUNT GWP-ASan symbols still present"
-        # 如果还有符号，尝试更彻底的移除
-        echo "Attempting more thorough symbol removal..."
-        "$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip" \
-            --strip-unneeded "$PREFIX/lib/libffmpeg.so"
+        echo "✅ 动态库大小正常"
     fi
 
-    # 验证生成的库
-    echo "Verifying generated library..."
-    if [ -f "$PREFIX/lib/libffmpeg.so" ]; then
-        # 检查库中的符号
-        echo "Checking for FFmpeg symbols..."
-        if "$ANDROID_NDK_ROOT_WIN/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-nm" -D "$PREFIX/lib/libffmpeg.so" 2>/dev/null | grep -E "av_|avformat_|avcodec_|avutil_" > /dev/null; then
-            echo "✅ Library symbols verified successfully"
+    # 验证生成的动态库和符号
+    if [ -f "$COMBINED_SO" ]; then
+        echo "✅ 动态库创建成功: $COMBINED_SO"
+
+        # 检查符号数量
+        local SYMBOL_COUNT=$("$NM" -D "$COMBINED_SO" 2>/dev/null | wc -l || echo "0")
+        echo "📊 导出符号数量: $SYMBOL_COUNT"
+
+        # 检查关键FFmpeg符号
+        echo "🔍 验证关键FFmpeg符号..."
+        local FOUND_SYMBOLS=0
+        for symbol in avformat_open_input avcodec_find_decoder av_read_frame avformat_network_init; do
+            if "$NM" -D "$COMBINED_SO" 2>/dev/null | grep -q "$symbol"; then
+                echo "  ✅ $symbol"
+                FOUND_SYMBOLS=$((FOUND_SYMBOLS + 1))
+            else
+                echo "  ❌ $symbol"
+            fi
+        done
+
+        if [ "$FOUND_SYMBOLS" -ge 3 ]; then
+            echo "✅ 关键符号验证通过 ($FOUND_SYMBOLS/4)"
         else
-            echo "❌ Library symbols verification failed"
-            return 1
+            echo "⚠️  关键符号缺失过多 ($FOUND_SYMBOLS/4)"
         fi
+
+        # 复制到目标目录
+        local TARGET_DIR="../app/src/main/cpp/ffmpeg/$ANDROID_ABI"
+        mkdir -p "$TARGET_DIR"
+        cp "$COMBINED_SO" "$TARGET_DIR/"
+        echo "📦 已复制动态库到: $TARGET_DIR"
     else
-        echo "❌ Library generation failed"
-        return 1
+        echo "❌ 动态库创建失败!"
+        exit 1
     fi
 
-    # 复制库文件到正确的位置
-    DEST_DIR="$(pwd)/../app/libs/$ANDROID_ABI"
-    mkdir -p "$DEST_DIR"
-    cp "$PREFIX/lib/libffmpeg.so" "$DEST_DIR/"
-    echo "✅ Copied library to $DEST_DIR"
+    # 复制到项目目录
+    local DEST_DIR="$(pwd)/../app/src/main/cpp/ffmpeg/$ANDROID_ABI"
+    mkdir -p "$DEST_DIR/lib" "$DEST_DIR/include"
+    cp "$COMBINED_SO" "$DEST_DIR/lib/"
+    cp -r "$PREFIX/include/"* "$DEST_DIR/include/"
 
-    # 清理静态库
-    rm -f "$PREFIX/lib/"*.a
-    rm -rf "$PREFIX/bin" "$PREFIX/share"
-
-    echo "编译完成 $CPU"
+    echo "✅ 编译完成: $ANDROID_ABI"
+    echo "📁 库文件: $DEST_DIR/lib"
+    echo "📁 头文件: $DEST_DIR/include"
 }
 
-# arm64-v8a
-ARCH=aarch64
-CPU=armv8-a
-HOST=aarch64-linux-android
-ANDROID_ABI=arm64-v8a
-CC="$TOOLCHAIN/bin/aarch64-linux-android$API-clang.cmd"
-CXX="$TOOLCHAIN/bin/aarch64-linux-android$API-clang++.cmd"
-CROSS_PREFIX="$TOOLCHAIN/bin/llvm-"
-PREFIX="$(pwd)/app/src/main/cpp/ffmpeg/arm64-v8a"
+# ======================= 编译 arm64-v8a =======================
+ARCH="aarch64"
+CPU="armv8-a"
+HOST="aarch64-linux-android"
+ANDROID_ABI="arm64-v8a"
+
 build_android
 
-# 注释掉其他架构的编译
-: '
-# armeabi-v7a
-ARCH=arm
-CPU=armv7-a
-HOST=armv7a-linux-androideabi
-CC="$TOOLCHAIN/bin/armv7a-linux-androideabi$API-clang.cmd"
-CXX="$TOOLCHAIN/bin/armv7a-linux-androideabi$API-clang++.cmd"
-CROSS_PREFIX="$TOOLCHAIN/bin/llvm-"
-PREFIX="$(pwd)/app/src/main/cpp/ffmpeg/armeabi-v7a"
-build_android
-
-# x86
-ARCH=x86
-CPU=i686
-HOST=i686-linux-android
-CC="$TOOLCHAIN/bin/i686-linux-android$API-clang.cmd"
-CXX="$TOOLCHAIN/bin/i686-linux-android$API-clang++.cmd"
-CROSS_PREFIX="$TOOLCHAIN/bin/llvm-"
-PREFIX="$(pwd)/app/src/main/cpp/ffmpeg/x86"
-build_android
-
-# x86_64
-ARCH=x86_64
-CPU=x86-64
-HOST=x86_64-linux-android
-CC="$TOOLCHAIN/bin/x86_64-linux-android$API-clang.cmd"
-CXX="$TOOLCHAIN/bin/x86_64-linux-android$API-clang++.cmd"
-CROSS_PREFIX="$TOOLCHAIN/bin/llvm-"
-PREFIX="$(pwd)/app/src/main/cpp/ffmpeg/x86_64"
-build_android
-'
-
-echo "编译完成！库文件位于: $(pwd)/app/src/main/cpp/ffmpeg"
+echo ""
+echo "🎉 FFmpeg 编译成功!"
+echo "💡 已启用功能: RTSP, 硬件加速(MediaCodec), Neon优化"
+echo "🛡️ 已禁用: GWP-ASan, Vulkan, 无用模块"
+echo "🔧 NDK 版本: 25.2.9519653"

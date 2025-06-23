@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <chrono>
+#include <thread>
 #include <unistd.h>
 
 #define LOG_TAG "FFmpegWrapper"
@@ -122,6 +123,15 @@ static int video_stream_index = -1;
 static ANativeWindow* native_window = nullptr;
 static ANativeWindow_Buffer window_buffer;
 static bool surface_locked = false;  // 跟踪Surface锁定状态
+static bool surface_valid = false;   // 跟踪Surface有效性
+static bool surface_ready = false;   // 跟踪Surface是否准备好渲染
+static std::mutex surface_mutex;     // Surface访问保护
+static std::mutex frame_processing_mutex; // 帧处理保护
+
+// 简化的Surface管理 - 不绑定Activity生命周期
+static std::atomic<bool> surface_being_recreated(false); // Surface正在重建
+static std::condition_variable surface_cv; // Surface状态变化通知
+
 
 #if FFMPEG_FOUND
 // FFmpeg相关的全局变量 - 只有在FFmpeg可用时才声明
@@ -142,8 +152,33 @@ static bool initializeFFmpegInternal() {
 // 渲染帧到Surface的辅助函数
 #if FFMPEG_FOUND
 static void renderFrameToSurface(AVFrame* frame) {
-    if (!native_window || !frame) {
-        LOGE("❌ renderFrameToSurface: native_window=%p, frame=%p", native_window, frame);
+    // 线程安全的Surface有效性检查
+    std::lock_guard<std::mutex> lock(surface_mutex);
+    
+    // 检查Surface是否正在重建
+    if (surface_being_recreated.load()) {
+        static int recreating_count = 0;
+        if (recreating_count++ % 50 == 0) {
+            LOGD("🔄 Surface正在重建，跳过渲染 (第%d次)", recreating_count);
+        }
+        return;
+    }
+    
+    if (!native_window || !frame || !surface_valid || !surface_ready) {
+        static int invalid_surface_count = 0;
+        if (invalid_surface_count++ % 50 == 0) {
+            LOGW("⚠️ Surface无效或帧为空: native_window=%p, frame=%p, surface_valid=%s, surface_ready=%s (第%d次)", 
+                 native_window, frame, surface_valid ? "true" : "false", surface_ready ? "true" : "false", invalid_surface_count);
+        }
+        return;
+    }
+    
+    // 双重检查Surface有效性
+    if (surface_locked) {
+        static int locked_count = 0;
+        if (locked_count++ % 30 == 0) {
+            LOGW("⚠️ Surface已被锁定，跳过渲染 (第%d次)", locked_count);
+        }
         return;
     }
     
@@ -248,19 +283,32 @@ static void renderFrameToSurface(AVFrame* frame) {
         input_format = (AVPixelFormat)frame->format;
     }
     
-    // 优化的SwsContext管理 - 使用静态缓存
+    // 线程安全的SwsContext管理
     static SwsContext* cached_sws_ctx = nullptr;
     static int cached_width = 0, cached_height = 0;
     static AVPixelFormat cached_format = AV_PIX_FMT_NONE;
+    static std::mutex sws_mutex;
     
-    // 更新SwsContext（如果需要）
-    if (!cached_sws_ctx || cached_width != frame->width || cached_height != frame->height || cached_format != input_format) {
+    SwsContext* current_sws_ctx = nullptr;
+    
+    // 线程安全地获取SwsContext - 添加Surface状态检查
+    {
+        std::lock_guard<std::mutex> sws_lock(sws_mutex);
         
-        // 释放旧的SwsContext
-        if (cached_sws_ctx) {
-            sws_freeContext(cached_sws_ctx);
-            cached_sws_ctx = nullptr;
+        // 检查Surface状态，防止在Surface重建期间操作SwsContext
+        if (surface_being_recreated.load() || !surface_valid) {
+            LOGD("🛑 Surface重建中或无效，跳过SwsContext操作");
+            return;
         }
+        
+        // 更新SwsContext（如果需要）
+        if (!cached_sws_ctx || cached_width != frame->width || cached_height != frame->height || cached_format != input_format) {
+            
+            // 释放旧的SwsContext
+            if (cached_sws_ctx) {
+                sws_freeContext(cached_sws_ctx);
+                cached_sws_ctx = nullptr;
+            }
         
         // 按优先级尝试创建SwsContext
         const AVPixelFormat try_formats[] = {
@@ -301,6 +349,21 @@ static void renderFrameToSurface(AVFrame* frame) {
         
         cached_width = frame->width;
         cached_height = frame->height;
+        }
+        
+        current_sws_ctx = cached_sws_ctx;
+    }
+    
+    // 检查SwsContext是否有效
+    if (!current_sws_ctx) {
+        LOGE("❌ SwsContext无效，跳过渲染");
+        return;
+    }
+    
+    // 再次检查Surface状态（SwsContext获取后可能Surface已变化）
+    if (!surface_valid || !native_window) {
+        LOGW("⚠️ Surface在SwsContext获取后变为无效，跳过渲染");
+        return;
     }
     
     // 超低延迟渲染：激进的跳帧策略
@@ -355,22 +418,59 @@ static void renderFrameToSurface(AVFrame* frame) {
         return;
     }
     
+    // 最终Surface安全检查
+    if (surface_locked || !surface_valid || !native_window) {
+        static int final_check_fail_count = 0;
+        if (final_check_fail_count++ % 30 == 0) {
+            LOGW("⚠️ 最终检查失败: locked=%s, valid=%s, window=%p (第%d次)", 
+                 surface_locked ? "true" : "false",
+                 surface_valid ? "true" : "false", 
+                 native_window, final_check_fail_count);
+        }
+        return;
+    }
+    
     // 尝试非阻塞锁定
     ANativeWindow_Buffer buffer;
     int lock_ret = ANativeWindow_lock(native_window, &buffer, nullptr);
     if (lock_ret != 0) {
-        LOGW("⚠️ ANativeWindow_lock失败: %d，跳过此帧", lock_ret);
+        static int lock_fail_count = 0;
+        if (lock_fail_count++ % 30 == 0) {
+            LOGW("⚠️ ANativeWindow_lock失败: %d，可能Surface已销毁 (第%d次)", lock_ret, lock_fail_count);
+        }
+        // Surface可能已经无效，标记为无效
+        surface_valid = false;
         return;
     }
-    surface_locked = true;  // 标记Surface已锁定
+    
+    // 成功锁定，标记状态
+    surface_locked = true;
     
     // 计算目标参数
     int dst_stride = buffer.stride * 4;
     uint8_t* dst_data[4] = {(uint8_t*)buffer.bits, nullptr, nullptr, nullptr};
     int dst_linesize[4] = {dst_stride, 0, 0, 0};
     
-    // 直接转换到window buffer
-    int ret = sws_scale(cached_sws_ctx, frame->data, frame->linesize, 0, frame->height,
+    // 最后一次检查：确保所有指针有效且Surface未被重建
+    if (!current_sws_ctx || !frame->data[0] || !dst_data[0] || !surface_valid || surface_being_recreated.load()) {
+        LOGE("❌ sws_scale前检查失败: sws_ctx=%p, frame_data=%p, dst_data=%p, surface_valid=%s, recreating=%s", 
+             current_sws_ctx, frame->data[0], dst_data[0], surface_valid ? "true" : "false",
+             surface_being_recreated.load() ? "true" : "false");
+        ANativeWindow_unlockAndPost(native_window);
+        surface_locked = false;
+        return;
+    }
+    
+    // 直接转换到window buffer - 使用线程安全的SwsContext
+    // 再次检查Surface状态，这是最后的保护
+    if (surface_being_recreated.load()) {
+        LOGE("❌ sws_scale执行前Surface被重建，中止");
+        ANativeWindow_unlockAndPost(native_window);
+        surface_locked = false;
+        return;
+    }
+    
+    int ret = sws_scale(current_sws_ctx, frame->data, frame->linesize, 0, frame->height,
                        dst_data, dst_linesize);
     
     if (ret > 0) {
@@ -452,9 +552,14 @@ static void cleanupFFmpegInternal() {
 #endif
 
     // 清理native window
-    if (native_window) {
-        ANativeWindow_release(native_window);
-        native_window = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(surface_mutex);
+        surface_valid = false;
+        surface_locked = false;
+        if (native_window) {
+            ANativeWindow_release(native_window);
+            native_window = nullptr;
+        }
     }
     
     // 重置状态 - 这些变量现在总是可用
@@ -1122,6 +1227,19 @@ Java_com_jxj_CompileFfmpeg_MainActivity_stopRtspRecording(JNIEnv *env, jobject /
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_jxj_CompileFfmpeg_MainActivity_processRtspFrame(JNIEnv *env, jobject /* thiz */) {
 #if FFMPEG_FOUND
+    // 检查Surface重建状态（简化版本，不依赖Activity生命周期）
+    if (surface_being_recreated.load()) {
+        // Surface正在重建，跳过帧处理但保持连接
+        static int recreating_count = 0;
+        if (recreating_count++ % 100 == 0) {
+            LOGD("🔄 Surface重建中，跳过帧处理 (第%d次)", recreating_count);
+        }
+        
+        // 短暂休眠避免CPU占用过高
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return JNI_TRUE; // 返回成功但不处理帧
+    }
+    
     if (!rtsp_connected || !rtsp_input_ctx || !decoder_ctx) {
         return JNI_FALSE;
     }
@@ -1347,10 +1465,25 @@ Java_com_jxj_CompileFfmpeg_MainActivity_processRtspFrame(JNIEnv *env, jobject /*
     // 清理临时帧
     av_frame_free(&temp_frame);
     
-    // 只渲染最新的有效帧
-    if (has_valid_frame && frame && native_window) {
-        renderFrameToSurface(frame);
-        processed_frame_count++;
+    // 只渲染最新的有效帧 - 再次检查Surface状态
+    if (has_valid_frame && frame) {
+        // 检查Surface是否仍然有效（简化版本）
+        bool can_render = false;
+        {
+            std::lock_guard<std::mutex> lock(surface_mutex);
+            can_render = native_window && surface_valid && surface_ready && 
+                        !surface_being_recreated.load();
+        }
+        
+        if (can_render) {
+            renderFrameToSurface(frame);
+            processed_frame_count++;
+        } else {
+            static int skip_render_count = 0;
+            if (skip_render_count++ % 100 == 0) {
+                LOGD("⏭️ 跳过渲染: Surface不可用 (第%d次)", skip_render_count);
+            }
+        }
     }
     
     // 处理录制（使用之前保存的packet拷贝）
@@ -1518,31 +1651,106 @@ Java_com_jxj_CompileFfmpeg_MainActivity_getProcessedFrameCount(JNIEnv *env, jobj
     return processed_frame_count;
 }
 
+// 移除Activity生命周期绑定 - 改为纯Surface状态管理
+
+
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_jxj_CompileFfmpeg_MainActivity_setSurface(JNIEnv *env, jobject /* thiz */, jobject surface) {
 #if FFMPEG_FOUND
+    // 线程安全的Surface设置
+    std::lock_guard<std::mutex> lock(surface_mutex);
+    
+    // 防止重复设置相同的Surface
+    static jobject last_surface_ref = nullptr;
+    static int surface_set_count = 0;
+    
+    LOGI("🔄 setSurface调用 #%d: surface=%p, last_surface=%p, native_window=%p", 
+         ++surface_set_count, surface, last_surface_ref, native_window);
+    
+    if (surface == last_surface_ref && native_window != nullptr && surface != nullptr) {
+        LOGW("⚠️ Surface相同且有效，跳过重复设置 (调用#%d)", surface_set_count);
+        return;
+    }
+    
     if (surface) {
-        LOGI("Setting surface for video rendering");
+        LOGI("🔄 Setting surface for video rendering");
+        
+        // 标记Surface正在重建，暂停所有渲染操作
+        surface_being_recreated.store(true);
+        surface_valid = false;
+        surface_ready = false;
+        
+        // 等待任何正在进行的渲染完成
+        int wait_count = 0;
+        while (surface_locked && wait_count < 50) { // 增加等待时间到500ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+        }
+        
+        if (surface_locked) {
+            LOGW("⚠️ Surface仍被锁定，强制继续");
+            surface_locked = false;
+        }
         
         // 释放之前的native window
         if (native_window) {
             ANativeWindow_release(native_window);
             native_window = nullptr;
+            LOGD("🗑️ 释放旧的native window");
         }
         
         // 获取新的native window
         native_window = ANativeWindow_fromSurface(env, surface);
         if (native_window) {
-            LOGI("✅ Native window created successfully");
+            // 短暂延迟确保Surface完全准备好
+            std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 增加延迟到50ms
+            
+            surface_valid = true;
+            surface_ready = true;
+            surface_locked = false;
+            last_surface_ref = surface;
+            
+            // 最后解除重建标记，允许渲染继续
+            surface_being_recreated.store(false);
+            
+            // 通知等待的线程Surface已准备好
+            surface_cv.notify_all();
+            
+            LOGI("✅ Native window创建成功，Surface已就绪，重建完成");
         } else {
-            LOGE("❌ Failed to create native window");
+            surface_valid = false;
+            surface_ready = false;
+            surface_being_recreated.store(false); // 即使失败也要解除标记
+            last_surface_ref = nullptr;
+            LOGE("❌ 创建native window失败");
         }
     } else {
-        LOGI("Clearing surface");
+        LOGI("🧹 清理Surface");
+        
+        // 标记Surface正在重建（清理阶段）
+        surface_being_recreated.store(true);
+        surface_valid = false;
+        surface_ready = false;
+        last_surface_ref = nullptr;
+        
+        // 等待渲染完成
+        int wait_count = 0;
+        while (surface_locked && wait_count < 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+        }
+        
+        surface_locked = false;
+        
         if (native_window) {
             ANativeWindow_release(native_window);
             native_window = nullptr;
+            LOGD("🗑️ Surface已清理");
         }
+        
+        // 清理完成，解除重建标记
+        surface_being_recreated.store(false);
     }
 #else
     LOGE("FFmpeg not available");

@@ -62,17 +62,26 @@ public class RtspPlayer implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        Log.d(TAG, "🔄 surfaceCreated: " + holder.getSurface());
         this.surface = holder.getSurface();
-        if (mainActivity != null) {
+        if (mainActivity != null && surface != null && surface.isValid()) {
             mainActivity.setSurface(surface);
         }
     }
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        this.surface = holder.getSurface();
-        if (mainActivity != null) {
-            mainActivity.setSurface(surface);
+        Log.d(TAG, "🔄 surfaceChanged: format=" + format + ", size=" + width + "x" + height);
+        Surface newSurface = holder.getSurface();
+        
+        // 只有当Surface真正改变时才重新设置
+        if (newSurface != this.surface) {
+            this.surface = newSurface;
+            if (mainActivity != null && surface != null && surface.isValid()) {
+                mainActivity.setSurface(surface);
+            }
+        } else {
+            Log.d(TAG, "🔄 Surface未改变，跳过重复设置");
         }
     }
 
