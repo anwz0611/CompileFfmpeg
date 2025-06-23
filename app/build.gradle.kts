@@ -19,16 +19,22 @@ android {
         
         // NDK配置
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-//            abiFilters += listOf("x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
+        
+        // 强制使用NDK 21来避免GWP-ASan问题
+        ndkVersion = "21.4.7075529"
         
         externalNativeBuild {
             cmake {
-                cppFlags += "-std=c++17"
+                cppFlags += listOf("-std=c++11", "-fexceptions")
                 arguments += listOf(
-                    "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-24"
+                    "-DANDROID_STL=c++_shared",  // 修改为 c++_shared
+                    "-DANDROID_PLATFORM=android-24",
+                    "-DANDROID_ARM_MODE=arm",
+                    "-DANDROID_ARM_NEON=TRUE",
+                    "-DANDROID_CPP_FEATURES=exceptions",
+                    "-DCMAKE_BUILD_TYPE=Release"
                 )
             }
         }
@@ -43,26 +49,36 @@ android {
             )
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
         }
     }
+
     buildFeatures {
         viewBinding = true
     }
 
-    
-
+    // 移除 jniLibs 配置，让 CMake 处理 FFmpeg 库
+    // sourceSets {
+    //     getByName("main") {
+    //         jniLibs {
+    //             srcDirs("src/main/cpp/ffmpeg")
+    //         }
+    //     }
+    // }
 }
 
-dependencies {
+// FFmpeg 库文件已经在正确位置，不需要复制任务
 
+dependencies {
     implementation(libs.appcompat)
     implementation(libs.material)
     implementation(libs.constraintlayout)

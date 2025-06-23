@@ -19,6 +19,8 @@ import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.view.SurfaceView;
+import android.view.Surface;
 
 import com.jxj.CompileFfmpeg.databinding.ActivityMainBinding;
 
@@ -34,9 +36,8 @@ public class MainActivity extends AppCompatActivity {
         // Used to load the 'CompileFfmpeg' library on application startup.
     static {
         try {
-            System.loadLibrary("ffmpeg");
+//            System.loadLibrary("ffmpeg");
             System.loadLibrary("CompileFfmpeg");
-
             Log.d(TAG, "✅ 成功加载CompileFfmpeg库");
             
         } catch (UnsatisfiedLinkError e) {
@@ -67,6 +68,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvDecoderInfo, tvLog;
     private Switch swHardwareDecode;
     private ScrollView logScrollView;
+    private SurfaceView surfaceView;
+    private TextView tvNoVideo;
     
     // RTSP 相关
     private RtspPlayer rtspPlayer;
@@ -150,10 +153,14 @@ public class MainActivity extends AppCompatActivity {
         swHardwareDecode = findViewById(R.id.sw_hardware_decode);
         logScrollView = findViewById(R.id.tv_log).getParent() instanceof ScrollView ? 
                        (ScrollView) findViewById(R.id.tv_log).getParent() : null;
+
+        surfaceView = findViewById(R.id.surface_view);
+        tvNoVideo = findViewById(R.id.tv_no_video);
     }
 
     private void initializeRtspPlayer() {
         rtspPlayer = new RtspPlayer(this);
+        rtspPlayer.setSurfaceView(surfaceView);
         rtspPlayer.setListener(new RtspPlayer.RtspPlayerListener() {
             @Override
             public void onStreamOpened(String streamInfo) {
@@ -162,6 +169,7 @@ public class MainActivity extends AppCompatActivity {
                     logMessage("📄 流信息: " + streamInfo);
                     updateConnectionState(true);
                     updateDecoderInfo();
+                    tvNoVideo.setVisibility(View.GONE);
                 });
             }
 
@@ -171,6 +179,8 @@ public class MainActivity extends AppCompatActivity {
                     logMessage("🔌 RTSP流已断开");
                     updateConnectionState(false);
                     resetPerformanceDisplay();
+                    tvNoVideo.setVisibility(View.VISIBLE);
+                    tvNoVideo.setText("等待视频连接...");
                 });
             }
 
@@ -198,6 +208,8 @@ public class MainActivity extends AppCompatActivity {
                     logMessage("❌ 错误: " + error);
                     updateConnectionState(false);
                     resetPerformanceDisplay();
+                    tvNoVideo.setVisibility(View.VISIBLE);
+                    tvNoVideo.setText("连接错误");
                 });
             }
 
@@ -208,6 +220,22 @@ public class MainActivity extends AppCompatActivity {
                     frameCount++;
                     if (performanceMonitor != null) {
                         performanceMonitor.updateFrameCount();
+                    }
+                });
+            }
+
+            @Override
+            public void onVideoSizeChanged(int width, int height) {
+                runOnUiThread(() -> {
+                    // 根据视频尺寸调整 SurfaceView 的大小，保持宽高比
+                    if (width > 0 && height > 0) {
+                        float videoRatio = (float) width / height;
+                        int surfaceWidth = surfaceView.getWidth();
+                        int newHeight = (int) (surfaceWidth / videoRatio);
+                        
+                        android.view.ViewGroup.LayoutParams params = surfaceView.getLayoutParams();
+                        params.height = newHeight;
+                        surfaceView.setLayoutParams(params);
                     }
                 });
             }
@@ -343,9 +371,18 @@ public class MainActivity extends AppCompatActivity {
                     performanceMonitor.recordDecodeTime(frameTime);
                 }
                 
-                // 限制帧率（避免过度占用CPU）
+                // 动态睡眠时间：根据帧处理时间调整
+                long sleepTime;
+                if (frameTime < 5) {
+                    sleepTime = 8;  // 处理很快，稍微休息
+                } else if (frameTime < 15) {
+                    sleepTime = 5;  // 处理中等，少休息
+                } else {
+                    sleepTime = 1;  // 处理较慢，几乎不休息
+                }
+                
                 try {
-                    Thread.sleep(16); // ~60 FPS
+                    Thread.sleep(sleepTime);
                 } catch (InterruptedException e) {
                     break;
                 }
@@ -711,4 +748,10 @@ public class MainActivity extends AppCompatActivity {
      * @return 已处理的帧数
      */
     public native int getProcessedFrameCount();
+
+    /**
+     * 设置视频输出的Surface
+     * @param surface Surface对象，用于显示视频
+     */
+    public native void setSurface(Surface surface);
 }

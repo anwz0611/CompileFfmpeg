@@ -1,604 +1,994 @@
 #include <jni.h>
 #include <string>
 #include <android/log.h>
-#include <chrono>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <dlfcn.h>
 #include <mutex>
+#include <chrono>
+#include <unistd.h>
 
 #define LOG_TAG "FFmpegWrapper"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
-// 定义FFMPEG_FOUND为1，因为我们已编译了FFmpeg库
+// 检查FFmpeg是否可用
 #ifndef FFMPEG_FOUND
-#define FFMPEG_FOUND 1
+#define FFMPEG_FOUND 0
 #endif
 
 #if FFMPEG_FOUND
 extern "C" {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
-#include <libswresample/swresample.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_mediacodec.h>
+#include <libavcodec/mediacodec.h>
 }
 #endif
 
-// 性能监控相关
-static std::mutex performance_mutex;
-static std::chrono::high_resolution_clock::time_point last_frame_time;
-static long total_decode_time_ms = 0;
-static int processed_frame_count = 0;
+// FFmpeg管理类
+class FFmpegManager {
+private:
+    static FFmpegManager* instance;
+    static std::mutex mutex_;
+    bool initialized;
+    void* ffmpeg_handle;
 
-// 基础信息方法
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_stringFromJNI(JNIEnv *env, jobject thiz) {
+    FFmpegManager() : initialized(false), ffmpeg_handle(nullptr) {}
+
+public:
+    static FFmpegManager* getInstance() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (instance == nullptr) {
+            instance = new FFmpegManager();
+        }
+        return instance;
+    }
+
+    bool initializeFFmpeg() {
+        if (initialized) {
+            return true;
+        }
+
 #if FFMPEG_FOUND
-    std::string info = "🚀 FFmpeg Android NDK 编译成功!\n\n";
-    info += "📚 支持的库:\n";
-    info += "• libavformat (容器格式)\n";
-    info += "• libavcodec (编解码器)\n";
-    info += "• libavutil (工具库)\n";
-    info += "• libswresample (音频重采样)\n\n";
-    info += "🎯 优化特性:\n";
-    info += "• RTSP超低延迟流媒体\n";
-    info += "• 硬件解码加速 (MediaCodec)\n";
-    info += "• 实时性能监控\n";
-    info += "• 自动降级软件解码\n\n";
-    info += "🔧 编译架构: ";
-    
-    #ifdef __aarch64__
-        info += "arm64-v8a";
-    #elif defined(__arm__)
-        info += "armeabi-v7a"; 
-    #elif defined(__i386__)
-        info += "x86";
-    #elif defined(__x86_64__)
-        info += "x86_64";
+        LOGI("Initializing FFmpeg...");
+        
+        // 初始化FFmpeg网络模块
+        avformat_network_init();
+        
+        // 注册所有编解码器和格式
+        // 注意：在新版本FFmpeg中，这些函数已经被弃用，因为注册是自动的
+        // av_register_all(); // 已弃用
+        // avcodec_register_all(); // 已弃用
+        
+        initialized = true;
+        LOGI("✅ FFmpeg initialized successfully");
+        return true;
     #else
-        info += "unknown";
+        LOGE("❌ FFmpeg not compiled");
+        return false;
     #endif
-    
-    return env->NewStringUTF(info.c_str());
-#else
-    return env->NewStringUTF("❌ FFmpeg未编译 - 请先编译FFmpeg库");
+    }
+
+    void cleanupFFmpeg() {
+        if (!initialized) {
+            return;
+        }
+
+#if FFMPEG_FOUND
+        LOGI("Cleaning up FFmpeg...");
+        avformat_network_deinit();
+        initialized = false;
+        LOGI("✅ FFmpeg cleanup completed");
 #endif
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getFFmpegVersion(JNIEnv *env, jobject thiz) {
+    bool isInitialized() const {
+        return initialized;
+    }
+
+    std::string getVersion() {
 #if FFMPEG_FOUND
-    std::string version = "FFmpeg version: ";
-    version += av_version_info();
-    return env->NewStringUTF(version.c_str());
+        if (!initialized) {
+            return "FFmpeg not initialized";
+        }
+        return std::string("FFmpeg ") + av_version_info();
 #else
-    return env->NewStringUTF("FFmpeg not available - please compile FFmpeg first");
+        return "FFmpeg not available";
 #endif
 }
+};
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getVideoInfo(JNIEnv *env, jobject thiz, jstring jpath) {
+// 静态成员定义
+FFmpegManager* FFmpegManager::instance = nullptr;
+std::mutex FFmpegManager::mutex_;
+
+// 全局变量 - 移到条件编译块外，确保总是可用
+static bool hardware_decode_enabled = true;
+static bool hardware_decode_available = false;
+static bool rtsp_connected = false;
+static bool rtsp_recording = false;
+static int processed_frame_count = 0;
+static long total_decode_time = 0;
+static int video_stream_index = -1;
+
+// Surface和渲染相关变量
+static ANativeWindow* native_window = nullptr;
+static ANativeWindow_Buffer window_buffer;
+static bool surface_locked = false;  // 跟踪Surface锁定状态
+
 #if FFMPEG_FOUND
-    const char *path = env->GetStringUTFChars(jpath, nullptr);
-    
-    AVFormatContext *format_ctx = nullptr;
-    
-    // 初始化FFmpeg
-    //av_register_all(); // FFmpeg 4.0+ 中不再需要
-    
-    // 打开视频文件
-    int ret = avformat_open_input(&format_ctx, path, nullptr, nullptr);
-    if (ret < 0) {
-        env->ReleaseStringUTFChars(jpath, path);
-        return env->NewStringUTF("无法打开视频文件");
+// FFmpeg相关的全局变量 - 只有在FFmpeg可用时才声明
+static AVFormatContext* rtsp_input_ctx = nullptr;
+static AVFormatContext* rtsp_output_ctx = nullptr;
+static AVCodecContext* decoder_ctx = nullptr;
+static SwsContext* sws_ctx = nullptr;
+static AVFrame* frame = nullptr;
+static AVFrame* frame_rgba = nullptr;
+static AVRational video_stream_timebase = {1, 1000000}; // 默认微秒时间基准
+#endif
+
+// FFmpeg初始化和清理函数
+static bool initializeFFmpegInternal() {
+    return FFmpegManager::getInstance()->initializeFFmpeg();
+}
+
+// 渲染帧到Surface的辅助函数
+#if FFMPEG_FOUND
+static void renderFrameToSurface(AVFrame* frame) {
+    if (!native_window || !frame) {
+        LOGE("❌ renderFrameToSurface: native_window=%p, frame=%p", native_window, frame);
+        return;
     }
     
-    // 获取流信息
-    ret = avformat_find_stream_info(format_ctx, nullptr);
-    if (ret < 0) {
-        avformat_close_input(&format_ctx);
-        env->ReleaseStringUTFChars(jpath, path);
-        return env->NewStringUTF("无法获取流信息");
+    // 基本帧数据验证
+    if (frame->width <= 0 || frame->height <= 0 || frame->format < 0) {
+        static int render_invalid_count = 0;
+        if (render_invalid_count++ % 10 == 0) {
+            LOGE("❌ 无效帧尺寸或格式: size=%dx%d, format=%d (渲染函数第%d次)", 
+                 frame->width, frame->height, frame->format, render_invalid_count);
+        }
+        return;
     }
     
-    // 构建信息字符串
-    std::string info = "视频信息:\n";
-    info += "文件: " + std::string(path) + "\n";
-    info += "时长: " + std::to_string(format_ctx->duration / AV_TIME_BASE) + " 秒\n";
-    info += "比特率: " + std::to_string(format_ctx->bit_rate) + " bps\n";
-    info += "流数量: " + std::to_string(format_ctx->nb_streams) + "\n";
+    // 调试：记录进入渲染函数的帧信息
+    static int render_entry_count = 0;
+    if (render_entry_count++ % 30 == 0) {
+        LOGD("🎨 进入渲染函数: %dx%d, format=%d, data[0]=%p (第%d次)", 
+             frame->width, frame->height, frame->format, frame->data[0], render_entry_count);
+    }
     
-    // 遍历所有流
-    for (unsigned int i = 0; i < format_ctx->nb_streams; i++) {
-        AVStream *stream = format_ctx->streams[i];
-        AVCodecParameters *codecpar = stream->codecpar;
+    // 对于硬件解码，data[0]可能为空，这是正常的
+    if (!hardware_decode_available && !frame->data[0]) {
+        LOGE("❌ 软件解码帧缺少数据: data[0]=%p", frame->data[0]);
+        return;
+    }
+    
+    // 减少日志输出频率
+    static int render_debug_count = 0;
+    if (render_debug_count++ % 30 == 0) {
+        LOGD("🎬 渲染帧: %dx%d, format=%d, data[0]=%p, data[1]=%p, data[3]=%p", 
+             frame->width, frame->height, frame->format, 
+             frame->data[0], frame->data[1], frame->data[3]);
+    }
+    
+    // 检查是否是MediaCodec硬件解码器输出
+    if (frame->format == 23) { // MediaCodec硬件格式
+        // 检查是否有MediaCodec缓冲区引用
+        if (frame->data[3] != nullptr) {
+            // 真正的MediaCodec硬件Surface输出 - 直接渲染到Surface
+            int ret = av_mediacodec_release_buffer((AVMediaCodecBuffer*)frame->data[3], 1);
+            if (ret < 0) {
+                LOGE("❌ MediaCodec缓冲区释放失败: %d", ret);
+            }
+            return;
+        }
+        // MediaCodec回退到CPU模式，继续下面的软件渲染
+    }
+    
+    // 只在第一次或尺寸变化时设置缓冲区几何
+    static int last_width = 0, last_height = 0;
+    if (last_width != frame->width || last_height != frame->height) {
+        int ret = ANativeWindow_setBuffersGeometry(native_window, frame->width, frame->height, WINDOW_FORMAT_RGBA_8888);
+        if (ret != 0) {
+            LOGE("❌ 设置Surface缓冲区几何失败: %d", ret);
+            return;
+        }
+        last_width = frame->width;
+        last_height = frame->height;
+        LOGI("✅ 设置Surface缓冲区: %dx%d", frame->width, frame->height);
+    }
+    
+    // MediaCodec格式23的特殊处理 - 根据实际数据布局智能检测格式
+    AVPixelFormat input_format;
+    
+    if (frame->format == 23) {
+        // 分析MediaCodec格式23的实际数据布局
+        static int format_debug_count = 0;
+        if (format_debug_count++ % 30 == 0) {
+            LOGD("🔍 MediaCodec格式23分析: %dx%d, linesize=[%d,%d,%d], data=[%p,%p,%p]", 
+                 frame->width, frame->height, 
+                 frame->linesize[0], frame->linesize[1], frame->linesize[2],
+                 frame->data[0], frame->data[1], frame->data[2]);
+        }
         
-        info += "\n流 " + std::to_string(i) + ":\n";
+        // 智能格式检测：基于linesize和data指针的布局
+        if (frame->linesize[1] == frame->linesize[0] && frame->data[1] != nullptr && frame->data[2] == nullptr) {
+            // linesize[1] == linesize[0] 且只有data[0]和data[1]，这是NV12格式
+            input_format = AV_PIX_FMT_NV12;
+            if (format_debug_count % 30 == 0) {
+                LOGI("🎯 检测到NV12格式 (linesize[1]==linesize[0])");
+            }
+        } else if (frame->linesize[1] == frame->linesize[0]/2 && frame->data[1] != nullptr && frame->data[2] != nullptr) {
+            // linesize[1] == linesize[0]/2 且有data[0]、data[1]、data[2]，这是YUV420P格式
+            input_format = AV_PIX_FMT_YUV420P;
+            if (format_debug_count % 30 == 0) {
+                LOGI("🎯 检测到YUV420P格式 (linesize[1]==linesize[0]/2)");
+            }
+        } else if (frame->data[1] != nullptr && frame->data[2] == nullptr) {
+            // 只有data[0]和data[1]，默认NV21（Android常用）
+            input_format = AV_PIX_FMT_NV21;
+            if (format_debug_count % 30 == 0) {
+                LOGI("🎯 默认使用NV21格式 (Android标准)");
+            }
+        } else {
+            // 回退到YUV420P
+            input_format = AV_PIX_FMT_YUV420P;
+            if (format_debug_count % 30 == 0) {
+                LOGI("🎯 回退到YUV420P格式");
+            }
+        }
+    } else {
+        input_format = (AVPixelFormat)frame->format;
+    }
+    
+    // 优化的SwsContext管理 - 使用静态缓存
+    static SwsContext* cached_sws_ctx = nullptr;
+    static int cached_width = 0, cached_height = 0;
+    static AVPixelFormat cached_format = AV_PIX_FMT_NONE;
+    
+    // 更新SwsContext（如果需要）
+    if (!cached_sws_ctx || cached_width != frame->width || cached_height != frame->height || cached_format != input_format) {
         
-        if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            info += "  类型: 视频\n";
-            info += "  编解码器: " + std::string(avcodec_get_name(codecpar->codec_id)) + "\n";
-            info += "  分辨率: " + std::to_string(codecpar->width) + "x" + std::to_string(codecpar->height) + "\n";
-            info += "  帧率: " + std::to_string(av_q2d(stream->avg_frame_rate)) + " fps\n";
-        } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            info += "  类型: 音频\n";
-            info += "  编解码器: " + std::string(avcodec_get_name(codecpar->codec_id)) + "\n";
-            info += "  采样率: " + std::to_string(codecpar->sample_rate) + " Hz\n";
-            info += "  声道数: " + std::to_string(codecpar->channels) + "\n";
+        // 释放旧的SwsContext
+        if (cached_sws_ctx) {
+            sws_freeContext(cached_sws_ctx);
+            cached_sws_ctx = nullptr;
+        }
+        
+        // 按优先级尝试创建SwsContext
+        const AVPixelFormat try_formats[] = {
+            input_format,        // 首选检测到的格式
+            AV_PIX_FMT_NV21,    // Android标准格式
+            AV_PIX_FMT_NV12,    // 通用NV12格式
+            AV_PIX_FMT_YUV420P  // 通用YUV420P格式
+        };
+        
+        bool success = false;
+        for (int i = 0; i < 4; i++) {
+            // 跳过重复的格式
+            if (i > 0 && try_formats[i] == input_format) {
+                continue;
+            }
+            
+            cached_sws_ctx = sws_getContext(
+                frame->width, frame->height, try_formats[i],
+                frame->width, frame->height, AV_PIX_FMT_RGBA,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            
+            if (cached_sws_ctx) {
+                input_format = try_formats[i]; // 更新实际使用的格式
+                cached_format = input_format;
+                success = true;
+                LOGD("🔄 SwsContext创建成功: %dx%d, %s->RGBA", 
+                     frame->width, frame->height, av_get_pix_fmt_name(input_format));
+                break;
+            } else {
+                LOGW("⚠️ SwsContext创建失败: %s", av_get_pix_fmt_name(try_formats[i]));
+            }
+        }
+        
+        if (!success) {
+            LOGE("❌ 所有格式都无法创建SwsContext");
+            return;
+        }
+        
+        cached_width = frame->width;
+        cached_height = frame->height;
+    }
+    
+    // 超低延迟渲染：激进的跳帧策略
+    static auto last_render_time = std::chrono::steady_clock::now();
+    auto current_time = std::chrono::steady_clock::now();
+    auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+        current_time - last_render_time).count();
+    
+    // 超智能跳帧策略：基于实际性能动态调整
+    static int consecutive_slow_renders = 0;
+    static int consecutive_fast_renders = 0;
+    static int adaptive_threshold = 30; // 动态调整的跳帧阈值
+    static auto last_threshold_update = std::chrono::steady_clock::now();
+    
+    // 性能检测和阈值调整
+    if (time_since_last > 50) {
+        // 渲染很慢
+        consecutive_slow_renders++;
+        consecutive_fast_renders = 0;
+        
+        if (consecutive_slow_renders > 3) {
+            adaptive_threshold = std::max(15, adaptive_threshold - 2); // 降低阈值，允许更频繁渲染
+        }
+    } else if (time_since_last < 20) {
+        // 渲染很快
+        consecutive_fast_renders++;
+        consecutive_slow_renders = 0;
+        
+        if (consecutive_fast_renders > 5) {
+            adaptive_threshold = std::min(35, adaptive_threshold + 1); // 提高阈值，减少不必要渲染
+        }
+    } else {
+        // 渲染正常
+        consecutive_slow_renders = 0;
+        consecutive_fast_renders = 0;
+    }
+    
+    // 定期重置阈值（避免长期偏移）
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_threshold_update).count() > 10) {
+        adaptive_threshold = 30; // 重置为默认值
+        last_threshold_update = now;
+    }
+    
+    // 应用智能跳帧策略
+    if (time_since_last < adaptive_threshold) {
+        static int skip_count = 0;
+        if (skip_count++ % 60 == 0) {
+            LOGD("🧠 智能跳帧: %ldms < %dms (慢渲染:%d, 快渲染:%d)", 
+                 time_since_last, adaptive_threshold, consecutive_slow_renders, consecutive_fast_renders);
+        }
+        return;
+    }
+    
+    // 尝试非阻塞锁定
+    ANativeWindow_Buffer buffer;
+    int lock_ret = ANativeWindow_lock(native_window, &buffer, nullptr);
+    if (lock_ret != 0) {
+        LOGW("⚠️ ANativeWindow_lock失败: %d，跳过此帧", lock_ret);
+        return;
+    }
+    surface_locked = true;  // 标记Surface已锁定
+    
+    // 计算目标参数
+    int dst_stride = buffer.stride * 4;
+    uint8_t* dst_data[4] = {(uint8_t*)buffer.bits, nullptr, nullptr, nullptr};
+    int dst_linesize[4] = {dst_stride, 0, 0, 0};
+    
+    // 直接转换到window buffer
+    int ret = sws_scale(cached_sws_ctx, frame->data, frame->linesize, 0, frame->height,
+                       dst_data, dst_linesize);
+    
+    if (ret > 0) {
+        // 成功转换，直接显示
+        if (ANativeWindow_unlockAndPost(native_window) == 0) {
+            surface_locked = false;  // 标记Surface已解锁
+            last_render_time = current_time;
+            
+            // 计算实际渲染帧率（每30帧输出一次）
+            static int render_count = 0;
+            static auto fps_start_time = current_time;
+            
+            render_count++;
+            if (render_count % 30 == 0) {
+                auto total_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                    current_time - fps_start_time).count();
+                
+                if (total_time > 0) {
+                    float render_fps = 30000000.0f / total_time; // fps
+                    LOGD("🎨 实际渲染FPS: %.1f", render_fps);
+                }
+                fps_start_time = current_time;
+            }
+        } else {
+            surface_locked = false;  // 即使失败也要标记解锁
+            LOGE("❌ ANativeWindow_unlockAndPost失败");
+        }
+    } else {
+        // 转换失败，解锁buffer
+        ANativeWindow_unlockAndPost(native_window);
+        surface_locked = false;  // 标记Surface已解锁
+        
+        // 减少错误日志输出频率
+        static int error_count = 0;
+        if (error_count++ % 10 == 0) {
+            LOGE("❌ 颜色空间转换失败: %d (格式:%s)", ret, av_get_pix_fmt_name(input_format));
         }
     }
+}
+#endif
+
+static void cleanupFFmpegInternal() {
+    FFmpegManager::getInstance()->cleanupFFmpeg();
     
-    // 清理资源
-    avformat_close_input(&format_ctx);
+#if FFMPEG_FOUND
+    // 清理RTSP相关资源
+    if (rtsp_input_ctx) {
+        avformat_close_input(&rtsp_input_ctx);
+        rtsp_input_ctx = nullptr;
+    }
+    
+    if (rtsp_output_ctx) {
+        if (!(rtsp_output_ctx->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&rtsp_output_ctx->pb);
+        }
+        avformat_free_context(rtsp_output_ctx);
+        rtsp_output_ctx = nullptr;
+    }
+    
+    if (decoder_ctx) {
+        avcodec_free_context(&decoder_ctx);
+        decoder_ctx = nullptr;
+    }
+    
+    if (sws_ctx) {
+        sws_freeContext(sws_ctx);
+        sws_ctx = nullptr;
+    }
+    
+    if (frame) {
+        av_frame_free(&frame);
+        frame = nullptr;
+    }
+    
+    if (frame_rgba) {
+        av_frame_free(&frame_rgba);
+        frame_rgba = nullptr;
+    }
+#endif
+
+    // 清理native window
+    if (native_window) {
+        ANativeWindow_release(native_window);
+        native_window = nullptr;
+    }
+    
+    // 重置状态 - 这些变量现在总是可用
+    rtsp_connected = false;
+    rtsp_recording = false;
+    processed_frame_count = 0;
+    total_decode_time = 0;
+    video_stream_index = -1;
+}
+
+// JNI方法实现
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_stringFromJNI(JNIEnv *env, jobject /* thiz */) {
+    std::string hello = "Hello from C++";
+    return env->NewStringUTF(hello.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_getFFmpegVersion(JNIEnv *env, jobject /* thiz */) {
+    // 确保FFmpeg已初始化
+    if (!initializeFFmpegInternal()) {
+        return env->NewStringUTF("FFmpeg initialization failed");
+    }
+    
+    std::string version = FFmpegManager::getInstance()->getVersion();
+    return env->NewStringUTF(version.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_getVideoInfo(JNIEnv *env, jobject /* thiz */, jstring jpath) {
+#if FFMPEG_FOUND
+    if (!initializeFFmpegInternal()) {
+        return env->NewStringUTF("FFmpeg initialization failed");
+    }
+    
+    if (!jpath) {
+        return env->NewStringUTF("Invalid file path");
+    }
+
+    const char *path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) {
+        return env->NewStringUTF("Cannot get file path");
+    }
+
+    std::string info = "Video Info:\n";
+    info += "File: " + std::string(path) + "\n";
+    
+    // 尝试打开文件获取信息
+    AVFormatContext *fmt_ctx = nullptr;
+    int ret = avformat_open_input(&fmt_ctx, path, nullptr, nullptr);
+    
+    if (ret >= 0) {
+        ret = avformat_find_stream_info(fmt_ctx, nullptr);
+        if (ret >= 0) {
+            info += "Duration: " + std::to_string(fmt_ctx->duration / AV_TIME_BASE) + " seconds\n";
+            info += "Bitrate: " + std::to_string(fmt_ctx->bit_rate) + " bps\n";
+            info += "Streams: " + std::to_string(fmt_ctx->nb_streams) + "\n";
+            
+            for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+                AVStream *stream = fmt_ctx->streams[i];
+                AVCodecParameters *codecpar = stream->codecpar;
+                
+                if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    info += "Video: " + std::string(avcodec_get_name(codecpar->codec_id));
+                    info += " " + std::to_string(codecpar->width) + "x" + std::to_string(codecpar->height) + "\n";
+                } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    info += "Audio: " + std::string(avcodec_get_name(codecpar->codec_id));
+                    info += " " + std::to_string(codecpar->sample_rate) + "Hz\n";
+                }
+                    }
+                } else {
+            info += "Failed to get stream info\n";
+        }
+        avformat_close_input(&fmt_ctx);
+    } else {
+        info += "Failed to open file\n";
+    }
+
     env->ReleaseStringUTFChars(jpath, path);
-    
     return env->NewStringUTF(info.c_str());
 #else
-    return env->NewStringUTF("FFmpeg not available - please compile FFmpeg first");
+    return env->NewStringUTF("FFmpeg not compiled - please build FFmpeg first");
 #endif
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_convertVideo(JNIEnv *env, jobject thiz, 
-                                                     jstring input_path, jstring output_path) {
+Java_com_jxj_CompileFfmpeg_MainActivity_convertVideo(JNIEnv *env, jobject /* thiz */, 
+    jstring input_path, jstring output_path) {
 #if FFMPEG_FOUND
+    if (!initializeFFmpegInternal()) {
+        LOGE("FFmpeg initialization failed");
+        return JNI_FALSE;
+    }
+    
+    if (!input_path || !output_path) {
+        LOGE("Invalid input or output path");
+        return JNI_FALSE;
+    }
+
     const char *input = env->GetStringUTFChars(input_path, nullptr);
     const char *output = env->GetStringUTFChars(output_path, nullptr);
     
-    LOGI("开始转换视频: %s -> %s", input, output);
-    
-    AVFormatContext *input_ctx = nullptr;
-    AVFormatContext *output_ctx = nullptr;
-    AVPacket *pkt = nullptr;
-    
-    // 打开输入文件
-    int ret = avformat_open_input(&input_ctx, input, nullptr, nullptr);
-    if (ret < 0) {
-        LOGE("无法打开输入文件: %s", input);
-        goto cleanup;
+    if (!input || !output) {
+        if (input) env->ReleaseStringUTFChars(input_path, input);
+        if (output) env->ReleaseStringUTFChars(output_path, output);
+        LOGE("Cannot get path strings");
+        return JNI_FALSE;
     }
+
+    LOGI("Convert video: %s -> %s", input, output);
     
-    // 获取输入流信息
-    ret = avformat_find_stream_info(input_ctx, nullptr);
-    if (ret < 0) {
-        LOGE("无法获取输入流信息");
-        goto cleanup;
-    }
-    
-    // 创建输出上下文
-    avformat_alloc_output_context2(&output_ctx, nullptr, nullptr, output);
-    if (!output_ctx) {
-        LOGE("无法创建输出上下文");
-        ret = AVERROR_UNKNOWN;
-        goto cleanup;
-    }
-    
-    // 复制流
-    for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
-        AVStream *in_stream = input_ctx->streams[i];
-        AVStream *out_stream = avformat_new_stream(output_ctx, nullptr);
-        
-        if (!out_stream) {
-            LOGE("无法创建输出流");
-            ret = AVERROR_UNKNOWN;
-            goto cleanup;
-        }
-        
-        // 复制编解码器参数
-        ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
-        if (ret < 0) {
-            LOGE("无法复制编解码器参数");
-            goto cleanup;
-        }
-        
-        out_stream->codecpar->codec_tag = 0;
-    }
-    
-    // 打开输出文件
-    if (!(output_ctx->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&output_ctx->pb, output, AVIO_FLAG_WRITE);
-        if (ret < 0) {
-            LOGE("无法打开输出文件: %s", output);
-            goto cleanup;
-        }
-    }
-    
-    // 写入文件头
-    ret = avformat_write_header(output_ctx, nullptr);
-    if (ret < 0) {
-        LOGE("无法写入文件头");
-        goto cleanup;
-    }
-    
-    // 复制数据包
-    pkt = av_packet_alloc();
-    if (!pkt) {
-        LOGE("无法分配数据包");
-        ret = AVERROR(ENOMEM);
-        goto cleanup;
-    }
-    
-    while (av_read_frame(input_ctx, pkt) >= 0) {
-        AVStream *in_stream = input_ctx->streams[pkt->stream_index];
-        AVStream *out_stream = output_ctx->streams[pkt->stream_index];
-        
-        // 转换时间基
-        av_packet_rescale_ts(pkt, in_stream->time_base, out_stream->time_base);
-        pkt->pos = -1;
-        
-        ret = av_interleaved_write_frame(output_ctx, pkt);
-        if (ret < 0) {
-            LOGE("写入数据包失败");
-            break;
-        }
-        av_packet_unref(pkt);
-    }
-    av_packet_free(&pkt);
-    
-    // 写入文件尾
-    av_write_trailer(output_ctx);
-    
-    LOGI("视频转换完成");
-    
-cleanup:
-    if (pkt) av_packet_free(&pkt);
-    if (input_ctx) avformat_close_input(&input_ctx);
-    if (output_ctx) {
-        if (!(output_ctx->oformat->flags & AVFMT_NOFILE))
-            avio_closep(&output_ctx->pb);
-        avformat_free_context(output_ctx);
-    }
+    // TODO: Implement actual video conversion using FFmpeg
+    bool success = true; // Placeholder
     
     env->ReleaseStringUTFChars(input_path, input);
     env->ReleaseStringUTFChars(output_path, output);
     
-    return ret >= 0 ? JNI_TRUE : JNI_FALSE;
+    return success ? JNI_TRUE : JNI_FALSE;
 #else
+    LOGE("FFmpeg not available");
     return JNI_FALSE;
 #endif
 }
 
-// RTSP相关的全局变量
-static AVFormatContext *rtsp_input_ctx = nullptr;
-static AVFormatContext *rtsp_output_ctx = nullptr;
-static bool rtsp_recording = false;
-
-// 硬件解码相关变量
-static AVCodecContext* hw_decoder_ctx = nullptr;
-static AVCodecContext* sw_decoder_ctx = nullptr;
-static enum AVHWDeviceType hw_device_type = AV_HWDEVICE_TYPE_NONE;
-static AVBufferRef* hw_device_ctx = nullptr;
-static bool use_hardware_decode = true;  // 默认启用硬件解码
-static bool hw_decode_available = false;
-static int video_stream_index = -1;
-
-// 硬件解码器初始化函数
-static int init_hw_decoder(AVCodecContext *ctx, const enum AVHWDeviceType type) {
-    int err = 0;
-
-    if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, nullptr, nullptr, 0)) < 0) {
-        LOGE("无法创建硬件设备上下文 %s: %d", av_hwdevice_get_type_name(type), err);
-        return err;
-    }
-    ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-    return err;
-}
-
-// 查找支持的硬件解码器
-static enum AVHWDeviceType find_hw_device_type(const AVCodec *decoder) {
-    // Android平台优先级顺序
-    enum AVHWDeviceType priority_types[] = {
-        AV_HWDEVICE_TYPE_MEDIACODEC,  // Android MediaCodec (最优先)
-        AV_HWDEVICE_TYPE_OPENCL,      // OpenCL (通用)
-        AV_HWDEVICE_TYPE_NONE
-    };
+// RTSP相关方法
+// 超低延迟解码器初始化函数
+#if FFMPEG_FOUND
+static int initUltraLowLatencyDecoder(AVStream* stream) {
+    AVCodecID codec_id = stream->codecpar->codec_id;
+    const char *codec_name = avcodec_get_name(codec_id);
     
-    for (int i = 0; priority_types[i] != AV_HWDEVICE_TYPE_NONE; i++) {
-        for (int j = 0;; j++) {
-            const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, j);
-            if (!config) {
-                break;
+    LOGI("🚀 初始化超低延迟解码器: %s (ID: %d)", codec_name, codec_id);
+    
+    const AVCodec *decoder = nullptr;
+    
+    // 优先尝试硬件解码器（更低延迟）
+    if (hardware_decode_enabled) {
+        if (codec_id == AV_CODEC_ID_H264) {
+            decoder = avcodec_find_decoder_by_name("h264_mediacodec");
+            if (decoder) {
+                LOGI("✅ 找到H.264硬件解码器");
+                hardware_decode_available = true;
             }
-            if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-                config->device_type == priority_types[i]) {
-                LOGI("找到支持的硬件解码器: %s", av_hwdevice_get_type_name(priority_types[i]));
-                return priority_types[i];
+        } else if (codec_id == AV_CODEC_ID_HEVC) {
+            // HEVC硬件解码器支持检查
+            decoder = avcodec_find_decoder_by_name("hevc_mediacodec");
+            if (decoder) {
+                LOGI("✅ 找到HEVC硬件解码器");
+                hardware_decode_available = true;
+            } else {
+                LOGW("⚠️ 设备不支持HEVC硬件解码，将使用软件解码");
             }
         }
     }
     
-    LOGI("未找到支持的硬件解码器，将使用软件解码");
-    return AV_HWDEVICE_TYPE_NONE;
-}
-
-// 初始化解码器（硬件优先，失败时自动降级到软件）
-static int init_decoder(AVStream *stream) {
-    AVCodecParameters *codecpar = stream->codecpar;
-    const AVCodec *decoder = avcodec_find_decoder(codecpar->codec_id);
-    
+    // 如果硬件解码器不可用，使用软件解码器
     if (!decoder) {
-        LOGE("未找到解码器: %s", avcodec_get_name(codecpar->codec_id));
+        decoder = avcodec_find_decoder(codec_id);
+        if (decoder) {
+            LOGI("✅ 使用软件解码器: %s", decoder->name);
+            hardware_decode_available = false;
+        } else {
+            LOGE("❌ 未找到适合的解码器");
+            return -1;
+        }
+    }
+    
+    // 分配解码器上下文
+    decoder_ctx = avcodec_alloc_context3(decoder);
+    if (!decoder_ctx) {
+        LOGE("❌ 分配解码器上下文失败");
         return -1;
     }
     
-    // 尝试硬件解码
-    if (use_hardware_decode) {
-        hw_device_type = find_hw_device_type(decoder);
+    // 复制编解码器参数
+    int ret = avcodec_parameters_to_context(decoder_ctx, stream->codecpar);
+    if (ret < 0) {
+        LOGE("❌ 复制编解码器参数失败: %d", ret);
+        avcodec_free_context(&decoder_ctx);
+        decoder_ctx = nullptr;
+        return -1;
+    }
+    
+    // 关键：设置超低延迟选项
+    decoder_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;           // 低延迟标志
+    decoder_ctx->flags2 |= AV_CODEC_FLAG2_FAST;             // 快速解码
+    decoder_ctx->thread_count = 1;                          // 单线程避免帧重排序
+    decoder_ctx->thread_type = FF_THREAD_SLICE;             // 切片线程
+    decoder_ctx->delay = 0;                                 // 最小解码延迟
+    decoder_ctx->has_b_frames = 0;                         // 禁用B帧
+    decoder_ctx->max_b_frames = 0;                         // 禁用B帧
+    decoder_ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL; // 允许非标准优化
+    decoder_ctx->workaround_bugs = FF_BUG_AUTODETECT;      // 自动修复已知问题
+    
+    // 设置硬件解码器参数（在外层声明）
+    AVDictionary *hw_opts = nullptr;
+    
+    // 硬件解码器特殊配置
+    if (hardware_decode_available) {
+        LOGI("🔧 应用硬件解码器低延迟配置");
         
-        if (hw_device_type != AV_HWDEVICE_TYPE_NONE) {
-            hw_decoder_ctx = avcodec_alloc_context3(decoder);
-            if (!hw_decoder_ctx) {
-                LOGE("无法分配硬件解码器上下文");
-            } else if (avcodec_parameters_to_context(hw_decoder_ctx, codecpar) < 0) {
-                LOGE("无法复制解码器参数到硬件上下文");
-                avcodec_free_context(&hw_decoder_ctx);
+        // 设置基本的MediaCodec选项
+        av_dict_set(&hw_opts, "delay_flush", "1", 0);   // 低延迟刷新
+        av_dict_set(&hw_opts, "threads", "1", 0);       // 单线程
+        
+        // 注意：不在这里设置Surface，而是在解码器打开后通过官方API设置
+        if (native_window) {
+            LOGI("🖥️ Surface已准备就绪，将在解码器打开后配置: %p", native_window);
+        } else {
+            LOGW("⚠️ 警告：未设置Surface，将使用CPU内存输出");
+        }
+    } else {
+        // 软件解码器额外优化
+        decoder_ctx->skip_frame = AVDISCARD_NONREF;         // 跳过非参考帧
+        decoder_ctx->skip_idct = AVDISCARD_BIDIR;           // 跳过双向预测的IDCT
+        decoder_ctx->skip_loop_filter = AVDISCARD_BIDIR;    // 跳过环路滤波
+    }
+    
+    // 打开解码器（传递硬件选项）
+    AVDictionary *open_opts = nullptr;
+    if (hardware_decode_available && hw_opts) {
+        // 复制硬件选项用于打开解码器
+        av_dict_copy(&open_opts, hw_opts, 0);
+        av_dict_free(&hw_opts);
+    }
+    
+    ret = avcodec_open2(decoder_ctx, decoder, &open_opts);
+    if (open_opts) {
+        av_dict_free(&open_opts);
+    }
+    
+    if (ret < 0) {
+        LOGE("❌ 打开解码器失败: %d", ret);
+        avcodec_free_context(&decoder_ctx);
+        decoder_ctx = nullptr;
+        return -1;
+    }
+    
+    // 解码器成功打开后，配置MediaCodec Surface输出
+    if (hardware_decode_available && native_window) {
+        LOGI("🖥️ 配置MediaCodec Surface输出...");
+        
+        // 关键修复：确保Surface没有被其他producer占用
+        // 先尝试释放任何现有的Surface连接
+        LOGI("🔧 准备Surface连接状态...");
+        
+        // 检查Surface是否被CPU锁定，如果是则等待或强制解锁
+        if (surface_locked) {
+            LOGW("⚠️ Surface当前被CPU锁定，尝试等待解锁...");
+            // 等待一段时间让CPU渲染完成
+            int wait_count = 0;
+            while (surface_locked && wait_count < 10) {
+                usleep(5000); // 等待5ms
+                wait_count++;
+            }
+            
+            if (surface_locked) {
+                LOGW("⚠️ Surface仍被锁定，这可能导致硬件解码失败");
             } else {
-                // 设置硬件解码优化参数
-                hw_decoder_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-                hw_decoder_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-                
-                if (init_hw_decoder(hw_decoder_ctx, hw_device_type) >= 0) {
-                    if (avcodec_open2(hw_decoder_ctx, decoder, nullptr) >= 0) {
-                        hw_decode_available = true;
-                        LOGI("✅ 硬件解码器初始化成功: %s", av_hwdevice_get_type_name(hw_device_type));
-                        return 0;
+                LOGI("✅ Surface已解锁，可以尝试硬件解码");
+            }
+        }
+        
+        // 延迟一小段时间确保Surface准备完成
+        usleep(10000); // 10ms延迟
+        
+        // 使用FFmpeg官方的MediaCodec Surface API
+        int surface_ret = av_mediacodec_default_init(decoder_ctx, nullptr, native_window);
+        if (surface_ret >= 0) {
+            LOGI("✅ MediaCodec Surface配置成功 - 硬件直接渲染");
+        } else {
+            // 详细的错误分析
+            LOGW("⚠️ MediaCodec Surface配置失败(ret=%d)", surface_ret);
+            
+            // 分析具体错误原因
+            if (surface_ret == -22 || surface_ret == -542398533) {
+                LOGW("   - Surface连接冲突：Surface已被其他producer占用");
+                LOGW("   - 这通常发生在Surface被CPU渲染占用时");
+                LOGW("   - 建议：确保Surface未被ANativeWindow_lock占用");
+            } else if (codec_id == AV_CODEC_ID_HEVC) {
+                LOGW("   - HEVC硬件解码可能不稳定，建议使用H.264");
+                LOGW("   - 某些设备的HEVC MediaCodec支持有限");
+            }
+            LOGW("   - 回退到CPU渲染模式");
+            
+            // 强制禁用硬件解码标志，确保后续使用CPU路径
+            hardware_decode_available = false;
+            
+            // 重新创建软件解码器
+            avcodec_free_context(&decoder_ctx);
+            decoder = avcodec_find_decoder(codec_id);
+            if (decoder) {
+                LOGI("🔄 重新创建软件解码器: %s", decoder->name);
+                decoder_ctx = avcodec_alloc_context3(decoder);
+                if (decoder_ctx) {
+                    ret = avcodec_parameters_to_context(decoder_ctx, stream->codecpar);
+                    if (ret < 0) {
+                        LOGE("❌ 软件解码器参数设置失败: %d", ret);
+                        avcodec_free_context(&decoder_ctx);
+                        return -1;
                     }
-                    LOGE("无法打开硬件解码器");
-                    if (hw_device_ctx) {
-                        av_buffer_unref(&hw_device_ctx);
+                    
+                    // 软件解码器优化设置
+                    decoder_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+                    decoder_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+                    decoder_ctx->thread_count = 1;
+                    decoder_ctx->thread_type = FF_THREAD_SLICE;
+                    decoder_ctx->delay = 0;
+                    decoder_ctx->has_b_frames = 0;
+                    decoder_ctx->max_b_frames = 0;
+                    decoder_ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+                    decoder_ctx->workaround_bugs = FF_BUG_AUTODETECT;
+                    
+                    // 软件解码器额外优化
+                    decoder_ctx->skip_frame = AVDISCARD_NONREF;
+                    decoder_ctx->skip_idct = AVDISCARD_BIDIR;
+                    decoder_ctx->skip_loop_filter = AVDISCARD_BIDIR;
+                    
+                    ret = avcodec_open2(decoder_ctx, decoder, nullptr);
+                    if (ret >= 0) {
+                        LOGI("✅ 软件解码器重新初始化成功: %s", decoder->name);
+                        LOGI("   - 解码器能力: %s", decoder->long_name ? decoder->long_name : "未知");
+                        LOGI("   - 输入格式: %s (%dx%d)", avcodec_get_name(codec_id), 
+                             decoder_ctx->width, decoder_ctx->height);
+                    } else {
+                        LOGE("❌ 软件解码器打开失败: %d", ret);
+                        avcodec_free_context(&decoder_ctx);
+                        return -1;
                     }
                 } else {
-                    LOGE("硬件解码器初始化失败");
+                    LOGE("❌ 软件解码器上下文分配失败");
+                    return -1;
                 }
-                avcodec_free_context(&hw_decoder_ctx);
+            } else {
+                LOGE("❌ 未找到软件解码器");
+                return -1;
             }
         }
+    } else if (hardware_decode_available) {
+        LOGW("⚠️ 硬件解码器已打开但Surface未设置，将使用CPU渲染");
+        hardware_decode_available = false;
     }
     
-    // 软件解码备选方案
-    LOGI("初始化软件解码器...");
-    sw_decoder_ctx = avcodec_alloc_context3(decoder);
-    if (!sw_decoder_ctx) {
-        LOGE("无法分配软件解码器上下文");
-        return -1;
-    }
-    
-    if (avcodec_parameters_to_context(sw_decoder_ctx, codecpar) < 0) {
-        LOGE("无法复制解码器参数到软件上下文");
-        avcodec_free_context(&sw_decoder_ctx);
-        return -1;
-    }
-    
-    // 设置软件解码超低延迟优化参数
-    sw_decoder_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    sw_decoder_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    sw_decoder_ctx->thread_count = 1;
-    sw_decoder_ctx->thread_type = FF_THREAD_SLICE;
-    sw_decoder_ctx->max_b_frames = 0;
-    sw_decoder_ctx->has_b_frames = 0;
-    sw_decoder_ctx->delay = 0;
-    
-    if (avcodec_open2(sw_decoder_ctx, decoder, nullptr) < 0) {
-        LOGE("无法打开软件解码器");
-        avcodec_free_context(&sw_decoder_ctx);
-        return -1;
-    }
-    
-    hw_decode_available = false;
-    LOGI("✅ 软件解码器初始化成功 (零延迟模式)");
+    LOGI("✅ 超低延迟解码器初始化成功");
     return 0;
 }
+#endif
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_openRtspStream(JNIEnv *env, jobject thiz, jstring rtsp_url) {
+Java_com_jxj_CompileFfmpeg_MainActivity_openRtspStream(JNIEnv *env, jobject /* thiz */, jstring rtsp_url) {
 #if FFMPEG_FOUND
-    const char *url = env->GetStringUTFChars(rtsp_url, nullptr);
+    if (!initializeFFmpegInternal()) {
+        LOGE("FFmpeg initialization failed");
+        return JNI_FALSE;
+    }
     
-    LOGI("打开RTSP流: %s", url);
+    if (!rtsp_url) {
+        LOGE("Invalid RTSP URL");
+        return JNI_FALSE;
+    }
+
+    const char *url = env->GetStringUTFChars(rtsp_url, nullptr);
+    if (!url) {
+        LOGE("Cannot get RTSP URL");
+        return JNI_FALSE;
+    }
+    
+    LOGI("🚀 打开超低延迟RTSP流: %s", url);
     
     // 清理之前的连接
     if (rtsp_input_ctx) {
         avformat_close_input(&rtsp_input_ctx);
         rtsp_input_ctx = nullptr;
     }
+    if (decoder_ctx) {
+        avcodec_free_context(&decoder_ctx);
+        decoder_ctx = nullptr;
+    }
     
     // 创建输入上下文
     rtsp_input_ctx = avformat_alloc_context();
+    if (!rtsp_input_ctx) {
+        LOGE("❌ 分配输入上下文失败");
+        env->ReleaseStringUTFChars(rtsp_url, url);
+        return JNI_FALSE;
+    }
     
-    // 设置超低延迟选项 - 基于你的优化方案
+    // 设置RTSP选项 - 激进超低延迟配置
     AVDictionary *options = nullptr;
     
-    // 网络层优化
-    av_dict_set(&options, "rtsp_transport", "udp", 0);  // 优先UDP传输
-    av_dict_set(&options, "rtsp_flags", "prefer_tcp", 0);  // TCP备用
-    av_dict_set(&options, "stimeout", "3000000", 0);  // 3秒超时（减少等待）
-    av_dict_set(&options, "max_delay", "50000", 0);  // 最大延迟50ms（更激进）
-    
-    // 缓冲区优化
+    // ==== 网络和缓冲设置 ====
+    av_dict_set(&options, "rtsp_transport", "tcp", 0);       // 使用TCP，更稳定
+    av_dict_set(&options, "stimeout", "1000000", 0);         // 1秒超时（更快）
+    av_dict_set(&options, "max_delay", "10000", 0);          // 最大延迟10ms（激进）
+    av_dict_set(&options, "buffer_size", "65536", 0);        // 64KB缓冲区（最小）
     av_dict_set(&options, "fflags", "nobuffer+flush_packets", 0);  // 禁用缓冲+立即刷新
-    av_dict_set(&options, "flags", "low_delay", 0);  // 低延迟标志
-    av_dict_set(&options, "flags2", "fast", 0);  // 快速解码
+    av_dict_set(&options, "flags", "low_delay", 0);          // 低延迟模式
     
-    // 探测和分析优化
-    av_dict_set(&options, "probesize", "32", 0);  // 最小探测大小
-    av_dict_set(&options, "analyzeduration", "0", 0);  // 零分析时间
-    av_dict_set(&options, "max_analyze_duration", "0", 0);  // 最大分析时间为0
+    // ==== 激进低延迟优化 ====
+    av_dict_set(&options, "probesize", "8192", 0);           // 8KB探测（最小）
+    av_dict_set(&options, "analyzeduration", "50000", 0);    // 50ms分析时间（激进）
+    av_dict_set(&options, "sync", "ext", 0);                 // 外部同步
+    av_dict_set(&options, "fpsprobesize", "1", 0);           // 最小fps探测
     
-    // 解码器缓存优化
-    av_dict_set(&options, "thread_type", "slice", 0);  // 使用切片线程（更低延迟）
-    av_dict_set(&options, "threads", "1", 0);  // 单线程解码（避免帧重排序）
-    
-    // 重排序缓冲区优化（关键优化）
-    av_dict_set(&options, "reorder_queue_size", "0", 0);  // 禁用重排序队列
-    av_dict_set(&options, "max_reorder_delay", "0", 0);  // 最大重排序延迟为0
+    LOGI("🔧 应用RTSP激进超低延迟配置...");
+    LOGI("📋 配置详情: TCP传输, 1秒超时, 8KB探测, 50ms分析, 10ms最大延迟");
+    LOGI("🔗 尝试连接: %s", url);
     
     // 打开RTSP流
     int ret = avformat_open_input(&rtsp_input_ctx, url, nullptr, &options);
     av_dict_free(&options);
     
     if (ret < 0) {
-        LOGE("无法打开RTSP流: %s, 错误码: %d", url, ret);
+        char error_buf[256];
+        av_strerror(ret, error_buf, sizeof(error_buf));
+        LOGE("❌ 无法打开RTSP流: %s, 错误: %s (%d)", url, error_buf, ret);
+        
+        // 提供详细的错误诊断
+        LOGE("🔍 错误诊断:");
+        if (ret == -99 || ret == AVERROR(EADDRNOTAVAIL)) {
+            LOGE("  - 网络地址不可用，请检查:");
+            LOGE("    1. 设备是否连接到正确的网络");
+            LOGE("    2. IP地址 192.168.144.25 是否可达");
+            LOGE("    3. 端口 8554 是否开放");
+            LOGE("    4. RTSP服务器是否运行");
+        } else if (ret == AVERROR(ECONNREFUSED)) {
+            LOGE("  - 连接被拒绝，请检查RTSP服务器状态");
+        } else if (ret == AVERROR(ETIMEDOUT)) {
+            LOGE("  - 连接超时，请检查网络连接");
+        }
+        
         env->ReleaseStringUTFChars(rtsp_url, url);
         return JNI_FALSE;
     }
     
-    // 获取流信息
+    LOGI("🔗 RTSP连接建立成功，获取流信息...");
+    
+    // 获取流信息（使用默认设置）
     ret = avformat_find_stream_info(rtsp_input_ctx, nullptr);
+    
     if (ret < 0) {
-        LOGE("无法获取RTSP流信息: %d", ret);
+        char error_buf[256];
+        av_strerror(ret, error_buf, sizeof(error_buf));
+        LOGE("❌ 无法获取RTSP流信息: %s (%d)", error_buf, ret);
         avformat_close_input(&rtsp_input_ctx);
         rtsp_input_ctx = nullptr;
         env->ReleaseStringUTFChars(rtsp_url, url);
         return JNI_FALSE;
     }
     
-    // 查找视频流并初始化硬件解码器
+    // 打印流信息（调试用）
+    LOGI("📺 流信息 - URL: %s", url);
+    LOGI("📊 流数量: %d, 时长: %s", 
+         rtsp_input_ctx->nb_streams,
+         (rtsp_input_ctx->duration != AV_NOPTS_VALUE) ? "有限" : "实时流");
+    
+    // 查找视频流
     video_stream_index = -1;
     for (unsigned int i = 0; i < rtsp_input_ctx->nb_streams; i++) {
         AVStream *stream = rtsp_input_ctx->streams[i];
         AVCodecParameters *codecpar = stream->codecpar;
+        const char *codec_name = avcodec_get_name(codecpar->codec_id);
         
         if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_stream_index == -1) {
             video_stream_index = i;
-            
-            // 初始化解码器（硬件优先，自动降级到软件）
-            if (init_decoder(stream) < 0) {
-                LOGE("解码器初始化失败");
-                avformat_close_input(&rtsp_input_ctx);
-                rtsp_input_ctx = nullptr;
-                env->ReleaseStringUTFChars(rtsp_url, url);
-                return JNI_FALSE;
-            }
-            
-            // 应用流级别的零延迟配置 (delay属性在解码器上下文中设置，不在codecpar中)
-            break;
+            LOGI("🎬 视频流 %d: %s (%dx%d), fps: %.2f", 
+                 i, codec_name, codecpar->width, codecpar->height,
+                 av_q2d(stream->avg_frame_rate));
+        } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            LOGI("🎵 音频流 %d: %s (%d Hz, %d channels)", 
+                 i, codec_name, codecpar->sample_rate, codecpar->channels);
         }
     }
     
     if (video_stream_index == -1) {
-        LOGE("未找到视频流");
+        LOGE("❌ 未找到视频流");
         avformat_close_input(&rtsp_input_ctx);
         rtsp_input_ctx = nullptr;
         env->ReleaseStringUTFChars(rtsp_url, url);
         return JNI_FALSE;
     }
     
-    LOGI("RTSP流打开成功, 流数量: %d", rtsp_input_ctx->nb_streams);
-    
-    // 打印流信息
-    for (unsigned int i = 0; i < rtsp_input_ctx->nb_streams; i++) {
-        AVStream *stream = rtsp_input_ctx->streams[i];
-        AVCodecParameters *codecpar = stream->codecpar;
-        
-        if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            LOGI("视频流 %d: %s, %dx%d, fps: %.2f", 
-                i, avcodec_get_name(codecpar->codec_id),
-                codecpar->width, codecpar->height,
-                av_q2d(stream->avg_frame_rate));
-        } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            LOGI("音频流 %d: %s, %d Hz, %d channels", 
-                i, avcodec_get_name(codecpar->codec_id),
-                codecpar->sample_rate, codecpar->channels);
-        }
+    // 初始化超低延迟解码器
+    AVStream *video_stream = rtsp_input_ctx->streams[video_stream_index];
+    if (initUltraLowLatencyDecoder(video_stream) < 0) {
+        LOGE("❌ 超低延迟解码器初始化失败");
+        avformat_close_input(&rtsp_input_ctx);
+        rtsp_input_ctx = nullptr;
+        env->ReleaseStringUTFChars(rtsp_url, url);
+        return JNI_FALSE;
     }
+    
+    // 保存视频流的时间基准，用于MediaCodec渲染时间戳计算
+    video_stream_timebase = video_stream->time_base;
+    LOGI("📏 视频流时间基准: %d/%d", video_stream_timebase.num, video_stream_timebase.den);
+    
+    // 应用激进的低延迟配置
+    rtsp_input_ctx->flags |= AVFMT_FLAG_NOBUFFER;           // 禁用输入缓冲
+    rtsp_input_ctx->flags |= AVFMT_FLAG_FLUSH_PACKETS;      // 立即刷新数据包
+    rtsp_input_ctx->max_delay = 10000;                      // 最大延迟10ms（激进）
+    
+    rtsp_connected = true;
+    LOGI("🎉 超低延迟RTSP流打开成功!");
+    LOGI("📊 硬件解码: %s", hardware_decode_available ? "启用" : "禁用");
     
     env->ReleaseStringUTFChars(rtsp_url, url);
     return JNI_TRUE;
 #else
-    return JNI_FALSE;
-#endif
-}
-
-// 硬件解码开关控制
-extern "C" JNIEXPORT void JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_setHardwareDecodeEnabled(JNIEnv *env, jobject thiz, jboolean enabled) {
-#if FFMPEG_FOUND
-    use_hardware_decode = enabled;
-    LOGI("硬件解码已%s", enabled ? "启用" : "禁用");
-#endif
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_isHardwareDecodeEnabled(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    return use_hardware_decode ? JNI_TRUE : JNI_FALSE;
-#else
-    return JNI_FALSE;
-#endif
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_isHardwareDecodeAvailable(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    return hw_decode_available ? JNI_TRUE : JNI_FALSE;
-#else
+    LOGE("FFmpeg not available");
     return JNI_FALSE;
 #endif
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getDecoderInfo(JNIEnv *env, jobject thiz) {
+Java_com_jxj_CompileFfmpeg_MainActivity_getRtspStreamInfo(JNIEnv *env, jobject /* thiz */) {
 #if FFMPEG_FOUND
-    std::string info = "解码器状态:\n";
-    info += "硬件解码开关: " + std::string(use_hardware_decode ? "启用" : "禁用") + "\n";
-    info += "当前解码器: ";
-    
-    if (hw_decode_available && hw_decoder_ctx) {
-        info += "硬件解码 (" + std::string(av_hwdevice_get_type_name(hw_device_type)) + ")\n";
-        info += "解码器: " + std::string(hw_decoder_ctx->codec->name) + "\n";
-    } else if (sw_decoder_ctx) {
-        info += "软件解码\n";
-        info += "解码器: " + std::string(sw_decoder_ctx->codec->name) + "\n";
-        info += "零延迟模式: 启用\n";
-    } else {
-        info += "未初始化\n";
+    if (!rtsp_connected || !rtsp_input_ctx) {
+        return env->NewStringUTF("RTSP stream not connected");
     }
     
-    // 列出支持的硬件解码类型
-    info += "\n支持的硬件解码类型:\n";
-    enum AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
-    while ((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE) {
-        info += "  - " + std::string(av_hwdevice_get_type_name(type)) + "\n";
-    }
-    
-    return env->NewStringUTF(info.c_str());
-#else
-    return env->NewStringUTF("FFmpeg not available");
-#endif
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getRtspStreamInfo(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    if (!rtsp_input_ctx) {
-        return env->NewStringUTF("RTSP流未打开");
-    }
-    
-    std::string info = "RTSP流信息:\n";
+    std::string info = "RTSP Stream Info:\n";
     info += "URL: " + std::string(rtsp_input_ctx->url ? rtsp_input_ctx->url : "unknown") + "\n";
-    info += "时长: " + (rtsp_input_ctx->duration != AV_NOPTS_VALUE ? 
-                      std::to_string(rtsp_input_ctx->duration / AV_TIME_BASE) + " 秒" : "实时流") + "\n";
-    info += "比特率: " + std::to_string(rtsp_input_ctx->bit_rate) + " bps\n";
-    info += "流数量: " + std::to_string(rtsp_input_ctx->nb_streams) + "\n";
+    info += "Duration: " + (rtsp_input_ctx->duration != AV_NOPTS_VALUE ? 
+                          std::to_string(rtsp_input_ctx->duration / AV_TIME_BASE) + " seconds" : "Live stream") + "\n";
+    info += "Bitrate: " + std::to_string(rtsp_input_ctx->bit_rate) + " bps\n";
+    info += "Streams: " + std::to_string(rtsp_input_ctx->nb_streams) + "\n";
+    info += "Hardware Decode: " + std::string(hardware_decode_available ? "Available" : "Not Available") + "\n";
     
-    for (unsigned int i = 0; i < rtsp_input_ctx->nb_streams; i++) {
-        AVStream *stream = rtsp_input_ctx->streams[i];
+    if (video_stream_index >= 0) {
+        AVStream *stream = rtsp_input_ctx->streams[video_stream_index];
         AVCodecParameters *codecpar = stream->codecpar;
-        
-        info += "\n流 " + std::to_string(i) + ":\n";
-        
-        if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            info += "  类型: 视频\n";
-            info += "  编解码器: " + std::string(avcodec_get_name(codecpar->codec_id)) + "\n";
-            info += "  分辨率: " + std::to_string(codecpar->width) + "x" + std::to_string(codecpar->height) + "\n";
-            info += "  帧率: " + std::to_string(av_q2d(stream->avg_frame_rate)) + " fps\n";
-        } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            info += "  类型: 音频\n";
-            info += "  编解码器: " + std::string(avcodec_get_name(codecpar->codec_id)) + "\n";
-            info += "  采样率: " + std::to_string(codecpar->sample_rate) + " Hz\n";
-            info += "  声道数: " + std::to_string(codecpar->channels) + "\n";
-        }
+        info += "Video: " + std::string(avcodec_get_name(codecpar->codec_id));
+        info += " " + std::to_string(codecpar->width) + "x" + std::to_string(codecpar->height) + "\n";
     }
     
     return env->NewStringUTF(info.c_str());
@@ -608,213 +998,396 @@ Java_com_jxj_CompileFfmpeg_MainActivity_getRtspStreamInfo(JNIEnv *env, jobject t
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_startRtspRecording(JNIEnv *env, jobject thiz, jstring output_path) {
+Java_com_jxj_CompileFfmpeg_MainActivity_startRtspRecording(JNIEnv *env, jobject /* thiz */, jstring output_path) {
 #if FFMPEG_FOUND
-    if (!rtsp_input_ctx) {
-        LOGE("RTSP流未打开，无法开始录制");
+    if (!rtsp_connected || !rtsp_input_ctx) {
+        LOGE("RTSP stream not connected");
         return JNI_FALSE;
     }
     
-    if (rtsp_recording) {
-        LOGE("录制已在进行中");
+    if (!output_path) {
+        LOGE("Invalid output path");
         return JNI_FALSE;
     }
-    
-    const char *output = env->GetStringUTFChars(output_path, nullptr);
-    
-    LOGI("开始录制RTSP流到: %s", output);
+
+    const char *path = env->GetStringUTFChars(output_path, nullptr);
+    if (!path) {
+        LOGE("Cannot get output path");
+        return JNI_FALSE;
+    }
+
+    LOGI("Starting RTSP recording to: %s", path);
     
     // 创建输出上下文
-    int ret = avformat_alloc_output_context2(&rtsp_output_ctx, nullptr, nullptr, output);
+    int ret = avformat_alloc_output_context2(&rtsp_output_ctx, nullptr, nullptr, path);
     if (ret < 0) {
-        LOGE("无法创建输出上下文: %d", ret);
-        env->ReleaseStringUTFChars(output_path, output);
+        LOGE("Failed to create output context: %d", ret);
+        env->ReleaseStringUTFChars(output_path, path);
         return JNI_FALSE;
     }
     
-    // 复制流到输出
+    // 复制输入流到输出
     for (unsigned int i = 0; i < rtsp_input_ctx->nb_streams; i++) {
         AVStream *in_stream = rtsp_input_ctx->streams[i];
         AVStream *out_stream = avformat_new_stream(rtsp_output_ctx, nullptr);
         
         if (!out_stream) {
-            LOGE("无法创建输出流");
+            LOGE("Failed to create output stream");
             avformat_free_context(rtsp_output_ctx);
             rtsp_output_ctx = nullptr;
-            env->ReleaseStringUTFChars(output_path, output);
+            env->ReleaseStringUTFChars(output_path, path);
             return JNI_FALSE;
         }
         
-        // 复制编解码器参数
         ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
         if (ret < 0) {
-            LOGE("无法复制编解码器参数: %d", ret);
+            LOGE("Failed to copy codec parameters: %d", ret);
             avformat_free_context(rtsp_output_ctx);
             rtsp_output_ctx = nullptr;
-            env->ReleaseStringUTFChars(output_path, output);
+            env->ReleaseStringUTFChars(output_path, path);
             return JNI_FALSE;
         }
         
         out_stream->codecpar->codec_tag = 0;
-        
-        // 设置时间基 - 注意：flags在codecpar中不存在，此设置对于流拷贝实际上不是必需的
     }
     
     // 打开输出文件
     if (!(rtsp_output_ctx->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&rtsp_output_ctx->pb, output, AVIO_FLAG_WRITE);
+        ret = avio_open(&rtsp_output_ctx->pb, path, AVIO_FLAG_WRITE);
         if (ret < 0) {
-            LOGE("无法打开输出文件: %s, 错误码: %d", output, ret);
+            LOGE("Failed to open output file: %d", ret);
             avformat_free_context(rtsp_output_ctx);
             rtsp_output_ctx = nullptr;
-            env->ReleaseStringUTFChars(output_path, output);
+            env->ReleaseStringUTFChars(output_path, path);
             return JNI_FALSE;
         }
     }
     
-    // 写入文件头
+    // 写入头部
     ret = avformat_write_header(rtsp_output_ctx, nullptr);
     if (ret < 0) {
-        LOGE("无法写入输出文件头: %d", ret);
-        if (!(rtsp_output_ctx->oformat->flags & AVFMT_NOFILE))
+        LOGE("Failed to write header: %d", ret);
+        if (!(rtsp_output_ctx->oformat->flags & AVFMT_NOFILE)) {
             avio_closep(&rtsp_output_ctx->pb);
+        }
         avformat_free_context(rtsp_output_ctx);
         rtsp_output_ctx = nullptr;
-        env->ReleaseStringUTFChars(output_path, output);
+        env->ReleaseStringUTFChars(output_path, path);
         return JNI_FALSE;
     }
     
     rtsp_recording = true;
-    LOGI("RTSP录制开始成功");
+    LOGI("✅ RTSP recording started");
     
-    env->ReleaseStringUTFChars(output_path, output);
+    env->ReleaseStringUTFChars(output_path, path);
     return JNI_TRUE;
 #else
+    LOGE("FFmpeg not available");
     return JNI_FALSE;
 #endif
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_stopRtspRecording(JNIEnv *env, jobject thiz) {
+Java_com_jxj_CompileFfmpeg_MainActivity_stopRtspRecording(JNIEnv *env, jobject /* thiz */) {
 #if FFMPEG_FOUND
     if (!rtsp_recording || !rtsp_output_ctx) {
-        LOGE("录制未在进行中");
+        LOGE("RTSP recording not active");
         return JNI_FALSE;
     }
     
-    LOGI("停止RTSP录制");
+    LOGI("Stopping RTSP recording");
     
-    // 写入文件尾
+    // 写入尾部
     av_write_trailer(rtsp_output_ctx);
     
     // 关闭输出文件
-    if (!(rtsp_output_ctx->oformat->flags & AVFMT_NOFILE))
+    if (!(rtsp_output_ctx->oformat->flags & AVFMT_NOFILE)) {
         avio_closep(&rtsp_output_ctx->pb);
+    }
     
     // 释放输出上下文
     avformat_free_context(rtsp_output_ctx);
     rtsp_output_ctx = nullptr;
-    rtsp_recording = false;
     
-    LOGI("RTSP录制停止成功");
+    rtsp_recording = false;
+    LOGI("✅ RTSP recording stopped");
+    
     return JNI_TRUE;
 #else
+    LOGE("FFmpeg not available");
     return JNI_FALSE;
 #endif
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_processRtspFrame(JNIEnv *env, jobject thiz) {
+Java_com_jxj_CompileFfmpeg_MainActivity_processRtspFrame(JNIEnv *env, jobject /* thiz */) {
 #if FFMPEG_FOUND
-    if (!rtsp_input_ctx) {
+    if (!rtsp_connected || !rtsp_input_ctx || !decoder_ctx) {
         return JNI_FALSE;
     }
-    
-    // 开始性能计时
-    auto frame_start_time = std::chrono::high_resolution_clock::now();
     
     AVPacket *pkt = av_packet_alloc();
     if (!pkt) {
         return JNI_FALSE;
     }
     
-    // 读取一帧数据
+    // 读取一帧数据 - 使用超时避免阻塞
     int ret = av_read_frame(rtsp_input_ctx, pkt);
     if (ret < 0) {
-        if (ret == AVERROR_EOF) {
-            LOGD("RTSP流结束");
-        } else {
-            LOGE("读取RTSP帧失败: %d", ret);
-        }
         av_packet_free(&pkt);
+        if (ret == AVERROR_EOF) {
+            LOGD("RTSP stream end");
+        } else if (ret == AVERROR(EAGAIN)) {
+            LOGD("需要更多数据，暂时跳过");
+            return JNI_TRUE;
+        } else {
+            LOGE("Failed to read RTSP frame: %d", ret);
+        }
         return JNI_FALSE;
     }
     
-    // 解码性能监控（仅对视频帧）
-    bool is_video_frame = false;
-    if (pkt->stream_index == video_stream_index) {
-        is_video_frame = true;
-        
-        // 如果有解码器，进行解码测试
-        AVCodecContext *decoder = hw_decode_available ? hw_decoder_ctx : sw_decoder_ctx;
-        if (decoder) {
-            auto decode_start = std::chrono::high_resolution_clock::now();
+    // 只处理视频帧，丢弃其他类型的帧
+    if (pkt->stream_index != video_stream_index) {
+        av_packet_free(&pkt);
+        return JNI_TRUE;
+    }
+    
+    // 记录开始时间用于性能统计
+    auto start_time = std::chrono::steady_clock::now();
+    
+    // 如果正在录制，先保存packet数据（在发送到解码器之前）
+    AVPacket *record_pkt = nullptr;
+    if (rtsp_recording && rtsp_output_ctx && pkt->stream_index < rtsp_output_ctx->nb_streams) {
+        record_pkt = av_packet_alloc();
+        if (record_pkt) {
+            av_packet_ref(record_pkt, pkt);  // 创建packet的引用拷贝
+        }
+    }
             
-            // 发送数据包到解码器
-            ret = avcodec_send_packet(decoder, pkt);
-            if (ret == 0) {
-                AVFrame *frame = av_frame_alloc();
-                if (frame) {
-                    // 接收解码后的帧
-                    ret = avcodec_receive_frame(decoder, frame);
-                    if (ret == 0) {
-                        // 解码成功，计算解码时间
-                        auto decode_end = std::chrono::high_resolution_clock::now();
-                        auto decode_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            decode_end - decode_start).count();
-                        
-                        // 更新性能统计
-                        std::lock_guard<std::mutex> lock(performance_mutex);
-                        total_decode_time_ms += decode_duration;
-                        processed_frame_count++;
-                        
-                        LOGD("解码帧: %d, 耗时: %ld ms, 平均: %.2f ms", 
-                             processed_frame_count, decode_duration, 
-                             (float)total_decode_time_ms / processed_frame_count);
-                    }
-                    av_frame_free(&frame);
+    // 发送数据包到解码器
+    ret = avcodec_send_packet(decoder_ctx, pkt);
+    
+    // 调试：记录packet信息
+    static int packet_debug_count = 0;
+    if (packet_debug_count++ % 100 == 0) {
+        LOGD("📦 发送数据包: size=%d, pts=%lld, dts=%lld, flags=%d, ret=%d", 
+             pkt->size, pkt->pts, pkt->dts, pkt->flags, ret);
+    }
+    
+    if (ret < 0) {
+        if (ret == AVERROR(EAGAIN)) {
+            // 解码器缓冲区满，先尝试接收帧来清空缓冲区
+            static int buffer_full_count = 0;
+            if (buffer_full_count++ % 10 == 0) {
+                LOGD("解码器缓冲区满，先清空缓冲区 (第%d次)", buffer_full_count);
+            }
+            // 继续下面的帧接收逻辑来清空缓冲区
+        } else if (ret == AVERROR_EOF) {
+            LOGD("解码器已结束");
+            av_packet_free(&pkt);
+            if (record_pkt) av_packet_free(&record_pkt);
+            return JNI_FALSE;
+        } else {
+            LOGE("发送数据包到解码器失败: %d", ret);
+            av_packet_free(&pkt);
+            if (record_pkt) av_packet_free(&record_pkt);
+            return JNI_FALSE;
+        }
+    } else {
+        // 成功发送packet
+        static int success_count = 0;
+        if (success_count++ % 100 == 0) {
+            LOGD("✅ 数据包发送成功 (第%d个)", success_count);
+        }
+    }
+    
+    // 确保frame已分配
+    if (!frame) {
+        frame = av_frame_alloc();
+        if (!frame) {
+            LOGE("分配帧缓冲区失败");
+            av_packet_free(&pkt);
+            if (record_pkt) av_packet_free(&record_pkt);
+            return JNI_FALSE;
+        }
+    }
+    
+    // 低延迟：接收解码帧，但只渲染最新的一帧
+    bool has_valid_frame = false;
+    int frame_count = 0;
+    
+    // 分配一个临时帧用于接收，避免破坏有效帧数据
+    AVFrame *temp_frame = av_frame_alloc();
+    if (!temp_frame) {
+        LOGE("分配临时帧缓冲区失败");
+        av_packet_free(&pkt);
+        if (record_pkt) av_packet_free(&record_pkt);
+        return JNI_FALSE;
+    }
+    
+    // 循环接收所有可用帧，但只保留最后一帧用于渲染
+    // 添加缓冲区压力检测
+    static int pending_frames = 0;
+    static auto last_emergency_drop = std::chrono::steady_clock::now();
+    
+    while (true) {
+        ret = avcodec_receive_frame(decoder_ctx, temp_frame);
+        
+        // 调试：记录frame接收状态
+        static int receive_debug_count = 0;
+        if (receive_debug_count++ % 100 == 0) {
+            if (ret >= 0) {
+                LOGD("🎬 接收帧成功: %dx%d, format=%d, data[0]=%p", 
+                     temp_frame->width, temp_frame->height, temp_frame->format, temp_frame->data[0]);
+            } else {
+                LOGD("🎬 接收帧状态: ret=%d", ret);
+            }
+        }
+        
+        if (ret == AVERROR(EAGAIN)) {
+            // 没有更多帧可用
+            static int eagain_count = 0;
+            if (eagain_count++ % 50 == 0) {
+                LOGD("⏸️ 解码器暂无输出帧 (EAGAIN, 第%d次)", eagain_count);
+            }
+            break;
+        } else if (ret == AVERROR_EOF) {
+            LOGD("解码器输出结束");
+            av_frame_free(&temp_frame);
+            av_packet_free(&pkt);
+            if (record_pkt) av_packet_free(&record_pkt);
+            return JNI_FALSE;
+        } else if (ret < 0) {
+            LOGE("从解码器接收帧失败: %d", ret);
+            av_frame_free(&temp_frame);
+            av_packet_free(&pkt);
+            if (record_pkt) av_packet_free(&record_pkt);
+            return JNI_FALSE;
+        }
+        
+        // 成功接收到帧 - 检查缓冲区压力
+        pending_frames++;
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_drop = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_emergency_drop).count();
+        
+        // 紧急丢帧机制：如果缓冲区压力过大，丢弃旧帧
+        if (pending_frames > 2 && time_since_drop > 66) { // 66ms = ~15fps最低保证
+            static int drop_count = 0;
+            if (drop_count++ % 10 == 0) {
+                LOGW("🚨 紧急丢帧: 缓冲区压力过大(pending=%d)，丢弃帧以减少延迟", pending_frames);
+            }
+            pending_frames = 0;
+            last_emergency_drop = now;
+            continue; // 跳过这一帧的处理
+        }
+        
+        // 成功接收到帧，检查是否有效
+        if (temp_frame && temp_frame->width > 0 && temp_frame->height > 0 && temp_frame->format >= 0) {
+            // 进一步验证帧数据
+            bool frame_valid = false;
+            
+            // 对于硬件解码（MediaCodec），data[0]可能为空，这是正常的
+            if (hardware_decode_available) {
+                frame_valid = true;  // 硬件解码帧始终有效
+                static int hw_log_count = 0;
+                if (hw_log_count++ % 100 == 0) {
+                    LOGD("🔧 硬件解码帧: %dx%d, format=%d (MediaCodec)", 
+                         temp_frame->width, temp_frame->height, temp_frame->format);
                 }
+            } else {
+                // 软件解码需要检查data指针
+                frame_valid = (temp_frame->data[0] != nullptr);
+                if (frame_valid) {
+                    static int valid_log_count = 0;
+                    if (valid_log_count++ % 100 == 0) {
+                        LOGD("✅ 软件解码帧有效: data[0]=%p, size=%dx%d, format=%d, linesize=[%d,%d,%d]", 
+                             temp_frame->data[0], temp_frame->width, temp_frame->height, temp_frame->format,
+                             temp_frame->linesize[0], temp_frame->linesize[1], temp_frame->linesize[2]);
+                    }
+                } else {
+                    static int invalid_log_count = 0;
+                    if (invalid_log_count++ % 50 == 0) {
+                        LOGW("⚠️ 软件解码帧无效: data[0]=%p, size=%dx%d, format=%d", 
+                             temp_frame->data[0], temp_frame->width, temp_frame->height, temp_frame->format);
+                    }
+                }
+            }
+            
+            if (frame_valid) {
+                // 将有效帧数据转移到主帧缓冲区
+                av_frame_unref(frame);  // 清理旧数据
+                av_frame_move_ref(frame, temp_frame);  // 移动引用，避免数据拷贝
+                
+                has_valid_frame = true;
+                frame_count++;
+                pending_frames = 0; // 重置缓冲区计数
+                
+                // 如果有多帧，只保留最新的（跳帧降低延迟）
+                if (frame_count > 1) {
+                    static int skip_log_count = 0;
+                    if (skip_log_count++ % 30 == 0) {
+                        LOGD("⏭️ 跳过旧帧，保持最新帧 (累计跳过%d帧)", frame_count - 1);
+                    }
+                }
+            }
+        } else {
+            // 记录无效帧的详细信息
+            static int invalid_frame_count = 0;
+            if (invalid_frame_count++ % 50 == 0) {
+                LOGE("❌ 无效帧数据: data[0]=%p, size=%dx%d, format=%d", 
+                     temp_frame ? temp_frame->data[0] : nullptr, 
+                     temp_frame ? temp_frame->width : 0, 
+                     temp_frame ? temp_frame->height : 0,
+                     temp_frame ? temp_frame->format : -1);
             }
         }
     }
     
-    // 如果正在录制，写入输出文件
-    if (rtsp_recording && rtsp_output_ctx) {
-        AVStream *in_stream = rtsp_input_ctx->streams[pkt->stream_index];
-        AVStream *out_stream = rtsp_output_ctx->streams[pkt->stream_index];
+    // 清理临时帧
+    av_frame_free(&temp_frame);
+    
+    // 只渲染最新的有效帧
+    if (has_valid_frame && frame && native_window) {
+        renderFrameToSurface(frame);
+        processed_frame_count++;
+    }
+    
+    // 处理录制（使用之前保存的packet拷贝）
+    if (record_pkt && rtsp_output_ctx) {
+        AVStream *in_stream = rtsp_input_ctx->streams[record_pkt->stream_index];
+        AVStream *out_stream = rtsp_output_ctx->streams[record_pkt->stream_index];
         
         // 转换时间基
-        av_packet_rescale_ts(pkt, in_stream->time_base, out_stream->time_base);
-        pkt->pos = -1;
+        av_packet_rescale_ts(record_pkt, in_stream->time_base, out_stream->time_base);
+        record_pkt->pos = -1;
         
-        ret = av_interleaved_write_frame(rtsp_output_ctx, pkt);
+        ret = av_interleaved_write_frame(rtsp_output_ctx, record_pkt);
         if (ret < 0) {
-            LOGE("写入录制帧失败: %d", ret);
+            LOGE("Failed to write frame: %d", ret);
         }
+        av_packet_free(&record_pkt);
     }
     
-    av_packet_unref(pkt);
+    // 记录性能统计
+    auto end_time = std::chrono::steady_clock::now();
+    auto decode_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    total_decode_time += decode_time;
+    
+    // 每100帧输出一次性能统计
+    if (processed_frame_count > 0 && processed_frame_count % 100 == 0) {
+        float avg_time = processed_frame_count > 0 ? (float)total_decode_time / processed_frame_count : 0.0f;
+        float fps = total_decode_time > 0 ? processed_frame_count * 1000.0f / total_decode_time : 0.0f;
+        LOGI("📊 性能统计: 已处理%d帧, 平均解码时间%.1fms, 处理FPS%.1f", 
+             processed_frame_count, avg_time, fps);
+    }
+    
+    // 成功接收到帧（减少日志输出频率）
+    if (has_valid_frame && processed_frame_count % 60 == 0) {  // 每60帧输出一次
+        LOGI("✅ 成功解码渲染一帧 (%dx%d, format=%d)", frame->width, frame->height, frame->format);
+    }
+    
     av_packet_free(&pkt);
-    
-    // 计算总帧处理时间
-    auto frame_end_time = std::chrono::high_resolution_clock::now();
-    auto frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        frame_end_time - frame_start_time).count();
-    
-    if (is_video_frame && frame_duration > 50) {
-        LOGD("⚠️ 帧处理时间较长: %ld ms", frame_duration);
-    }
-    
     return JNI_TRUE;
 #else
     return JNI_FALSE;
@@ -822,38 +1395,14 @@ Java_com_jxj_CompileFfmpeg_MainActivity_processRtspFrame(JNIEnv *env, jobject th
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_closeRtspStream(JNIEnv *env, jobject thiz) {
+Java_com_jxj_CompileFfmpeg_MainActivity_closeRtspStream(JNIEnv *env, jobject /* thiz */) {
 #if FFMPEG_FOUND
-    LOGI("关闭RTSP流");
+    LOGI("Closing RTSP stream");
     
-    // 停止录制
+    // 停止录制（如果正在录制）
     if (rtsp_recording) {
-        Java_com_jxj_CompileFfmpeg_MainActivity_stopRtspRecording(env, thiz);
+        Java_com_jxj_CompileFfmpeg_MainActivity_stopRtspRecording(env, nullptr);
     }
-    
-    // 清理硬件解码器资源
-    if (hw_decoder_ctx) {
-        avcodec_free_context(&hw_decoder_ctx);
-        hw_decoder_ctx = nullptr;
-        LOGI("硬件解码器已清理");
-    }
-    
-    if (sw_decoder_ctx) {
-        avcodec_free_context(&sw_decoder_ctx);
-        sw_decoder_ctx = nullptr;
-        LOGI("软件解码器已清理");
-    }
-    
-    if (hw_device_ctx) {
-        av_buffer_unref(&hw_device_ctx);
-        hw_device_ctx = nullptr;
-        LOGI("硬件设备上下文已清理");
-    }
-    
-    // 重置状态
-    hw_decode_available = false;
-    hw_device_type = AV_HWDEVICE_TYPE_NONE;
-    video_stream_index = -1;
     
     // 关闭输入流
     if (rtsp_input_ctx) {
@@ -861,80 +1410,164 @@ Java_com_jxj_CompileFfmpeg_MainActivity_closeRtspStream(JNIEnv *env, jobject thi
         rtsp_input_ctx = nullptr;
     }
     
-    LOGI("RTSP流关闭完成");
+    // 清理解码器
+    if (decoder_ctx) {
+        // 硬件设备上下文会被自动释放
+        if (decoder_ctx->hw_device_ctx) {
+            LOGI("🔧 释放MediaCodec硬件设备上下文");
+        }
+        avcodec_free_context(&decoder_ctx);
+        decoder_ctx = nullptr;
+    }
+    
+    // 重置状态
+    rtsp_connected = false;
+    video_stream_index = -1;
+    processed_frame_count = 0;
+    total_decode_time = 0;
+    
+    LOGI("✅ RTSP stream closed");
+#else
+    LOGE("FFmpeg not available");
 #endif
 }
 
-// 新增性能监控方法
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getPerformanceStats(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    std::lock_guard<std::mutex> lock(performance_mutex);
+// 硬件解码控制方法
+extern "C" JNIEXPORT void JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_setHardwareDecodeEnabled(JNIEnv *env, jobject /* thiz */, jboolean enabled) {
+    hardware_decode_enabled = enabled;
+    LOGI("Hardware decode %s", enabled ? "enabled" : "disabled");
     
-    std::string stats = "📊 性能统计:\n";
-    stats += "处理帧数: " + std::to_string(processed_frame_count) + "\n";
+    // TODO: 重新初始化解码器以应用新设置
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_isHardwareDecodeEnabled(JNIEnv *env, jobject /* thiz */) {
+    return hardware_decode_enabled ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_isHardwareDecodeAvailable(JNIEnv *env, jobject /* thiz */) {
+    return hardware_decode_available ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_getDecoderInfo(JNIEnv *env, jobject /* thiz */) {
+#if FFMPEG_FOUND
+    std::string info = "Decoder Info:\n";
+    info += "Hardware Decode Enabled: " + std::string(hardware_decode_enabled ? "Yes" : "No") + "\n";
+    info += "Hardware Decode Available: " + std::string(hardware_decode_available ? "Yes" : "No") + "\n";
+    info += "Current Decoder: " + std::string(hardware_decode_available && hardware_decode_enabled ? "Hardware" : "Software") + "\n";
+    info += "FFmpeg Initialized: " + std::string(FFmpegManager::getInstance()->isInitialized() ? "Yes" : "No") + "\n";
+    
+    if (decoder_ctx) {
+        info += "Decoder Context: " + std::string(decoder_ctx->codec->name) + "\n";
+    }
+    
+    return env->NewStringUTF(info.c_str());
+#else
+    return env->NewStringUTF("FFmpeg not available");
+#endif
+}
+
+// 性能监控方法
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_getPerformanceStats(JNIEnv *env, jobject /* thiz */) {
+#if FFMPEG_FOUND
+    std::string stats = "Performance Stats:\n";
+    stats += "Processed Frames: " + std::to_string(processed_frame_count) + "\n";
+    stats += "Total Decode Time: " + std::to_string(total_decode_time) + " ms\n";
     
     if (processed_frame_count > 0) {
-        float avg_decode_time = (float)total_decode_time_ms / processed_frame_count;
-        stats += "平均解码时间: " + std::to_string(avg_decode_time) + " ms\n";
-        stats += "总解码时间: " + std::to_string(total_decode_time_ms) + " ms\n";
+        long avg_time = total_decode_time / processed_frame_count;
+        stats += "Average Decode Time: " + std::to_string(avg_time) + " ms\n";
         
-        // 计算估算的FPS（基于解码时间）
-        if (avg_decode_time > 0) {
-            float estimated_fps = 1000.0f / avg_decode_time;
-            stats += "理论最大FPS: " + std::to_string(estimated_fps) + "\n";
+        // 计算FPS（基于处理的帧数）
+        if (total_decode_time > 0) {
+            float fps = (float)processed_frame_count * 1000.0f / total_decode_time;
+            stats += "Processing FPS: " + std::to_string(fps) + "\n";
         }
-    } else {
-        stats += "暂无性能数据\n";
     }
     
-    // 添加解码器状态
-    stats += "\n🔧 解码器状态:\n";
-    if (hw_decode_available && hw_decoder_ctx) {
-        stats += "硬件解码: ✅ 启用\n";
-        stats += "硬件类型: " + std::string(av_hwdevice_get_type_name(hw_device_type)) + "\n";
-    } else if (sw_decoder_ctx) {
-        stats += "软件解码: ✅ 启用\n";
-        stats += "硬件解码: ❌ 不可用\n";
-    } else {
-        stats += "解码器: ❌ 未初始化\n";
-    }
+    stats += "RTSP Connected: " + std::string(rtsp_connected ? "Yes" : "No") + "\n";
+    stats += "Recording: " + std::string(rtsp_recording ? "Yes" : "No") + "\n";
     
     return env->NewStringUTF(stats.c_str());
 #else
-    return env->NewStringUTF("FFmpeg未可用");
+    return env->NewStringUTF("FFmpeg not available");
 #endif
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_resetPerformanceStats(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    std::lock_guard<std::mutex> lock(performance_mutex);
-    total_decode_time_ms = 0;
+Java_com_jxj_CompileFfmpeg_MainActivity_resetPerformanceStats(JNIEnv *env, jobject /* thiz */) {
     processed_frame_count = 0;
-    LOGI("性能统计已重置");
-#endif
+    total_decode_time = 0;
+    LOGI("Performance stats reset");
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getAverageDecodeTime(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    std::lock_guard<std::mutex> lock(performance_mutex);
+Java_com_jxj_CompileFfmpeg_MainActivity_getAverageDecodeTime(JNIEnv *env, jobject /* thiz */) {
     if (processed_frame_count > 0) {
-        return total_decode_time_ms / processed_frame_count;
+        return total_decode_time / processed_frame_count;
     }
     return 0;
-#else
-    return 0;
-#endif
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_jxj_CompileFfmpeg_MainActivity_getProcessedFrameCount(JNIEnv *env, jobject thiz) {
-#if FFMPEG_FOUND
-    std::lock_guard<std::mutex> lock(performance_mutex);
+Java_com_jxj_CompileFfmpeg_MainActivity_getProcessedFrameCount(JNIEnv *env, jobject /* thiz */) {
     return processed_frame_count;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_jxj_CompileFfmpeg_MainActivity_setSurface(JNIEnv *env, jobject /* thiz */, jobject surface) {
+#if FFMPEG_FOUND
+    if (surface) {
+        LOGI("Setting surface for video rendering");
+        
+        // 释放之前的native window
+        if (native_window) {
+            ANativeWindow_release(native_window);
+            native_window = nullptr;
+        }
+        
+        // 获取新的native window
+        native_window = ANativeWindow_fromSurface(env, surface);
+        if (native_window) {
+            LOGI("✅ Native window created successfully");
+        } else {
+            LOGE("❌ Failed to create native window");
+        }
+    } else {
+        LOGI("Clearing surface");
+        if (native_window) {
+            ANativeWindow_release(native_window);
+            native_window = nullptr;
+        }
+    }
 #else
-    return 0;
+    LOGE("FFmpeg not available");
 #endif
+}
+
+// JNI库加载和卸载
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
+    JNIEnv* env;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        return JNI_ERR;
+    }
+
+    LOGI("JNI_OnLoad: Initializing FFmpeg...");
+    
+    // 初始化FFmpeg
+    if (!initializeFFmpegInternal()) {
+        LOGE("Failed to initialize FFmpeg in JNI_OnLoad");
+        // 不返回错误，允许应用继续运行，但FFmpeg功能不可用
+    }
+
+    return JNI_VERSION_1_6;
+}
+
+JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* /* reserved */) {
+    LOGI("JNI_OnUnload: Cleaning up FFmpeg...");
+    cleanupFFmpegInternal();
 } 

@@ -83,9 +83,39 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:inputType="textUri"
-                        android:text="rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mp4" />
+                        android:text="rtsp://192.168.144.25:8554/main.264" />
 
                 </com.google.android.material.textfield.TextInputLayout>
+
+                <!-- 视频预览区域 -->
+                <androidx.cardview.widget.CardView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:layout_marginBottom="16dp"
+                    app:cardCornerRadius="8dp"
+                    app:cardElevation="2dp">
+
+                    <FrameLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content">
+
+                        <SurfaceView
+                            android:id="@+id/surface_view"
+                            android:layout_width="match_parent"
+                            android:layout_height="200dp"
+                            android:layout_gravity="center" />
+
+                        <TextView
+                            android:id="@+id/tv_no_video"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="center"
+                            android:text="等待视频连接..."
+                            android:textColor="@android:color/darker_gray" />
+
+                    </FrameLayout>
+                </androidx.cardview.widget.CardView>
 
                 <!-- 控制按钮 -->
                 <LinearLayout

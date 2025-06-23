@@ -4,11 +4,14 @@ import android.os.AsyncTask;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 
 /**
  * RTSP播放器类 - 提供低延迟RTSP流播放和录制功能
  */
-public class RtspPlayer {
+public class RtspPlayer implements SurfaceHolder.Callback {
     private static final String TAG = "RtspPlayer";
     
     // 通过MainActivity访问native方法
@@ -18,6 +21,9 @@ public class RtspPlayer {
     private boolean isPlaying = false;
     private boolean isRecording = false;
     private FrameProcessTask frameTask;
+    private Surface surface;
+    private int videoWidth = 0;
+    private int videoHeight = 0;
     
     // 回调接口
     public interface RtspPlayerListener {
@@ -27,6 +33,7 @@ public class RtspPlayer {
         void onRecordingStopped();
         void onError(String error);
         void onFrameProcessed(); // 每处理一帧时回调
+        void onVideoSizeChanged(int width, int height); // 视频尺寸变化时回调
     }
     
     private RtspPlayerListener listener;
@@ -42,6 +49,49 @@ public class RtspPlayer {
     
     public void setListener(RtspPlayerListener listener) {
         this.listener = listener;
+    }
+
+    public void setSurfaceView(SurfaceView surfaceView) {
+        if (surfaceView != null) {
+            SurfaceHolder holder = surfaceView.getHolder();
+            holder.addCallback(this);
+            // 设置surface类型
+            holder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
+        }
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        this.surface = holder.getSurface();
+        if (mainActivity != null) {
+            mainActivity.setSurface(surface);
+        }
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        this.surface = holder.getSurface();
+        if (mainActivity != null) {
+            mainActivity.setSurface(surface);
+        }
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        this.surface = null;
+        if (mainActivity != null) {
+            mainActivity.setSurface(null);
+        }
+    }
+
+    public void setVideoSize(int width, int height) {
+        if (width != videoWidth || height != videoHeight) {
+            videoWidth = width;
+            videoHeight = height;
+            if (listener != null) {
+                listener.onVideoSizeChanged(width, height);
+            }
+        }
     }
     
     /**
@@ -225,8 +275,8 @@ public class RtspPlayer {
                             }
                         });
                         
-                        // 短暂休眠，避免CPU占用过高（可根据帧率调整）
-                        Thread.sleep(33); // 约30fps
+                        // 超低延迟模式：最小休眠时间
+                        Thread.sleep(5); // 最小延迟，让CPU有时间处理其他任务
                     } else {
                         // 处理失败，可能是流结束或出错
                         Log.w(TAG, "帧处理失败，可能是流结束");

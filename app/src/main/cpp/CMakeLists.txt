@@ -5,133 +5,127 @@
 # Sets the minimum CMake version required for this project.
 cmake_minimum_required(VERSION 3.22.1)
 
-# Declares the project name. The project name can be accessed via ${ PROJECT_NAME},
-# Since this is the top level CMakeLists.txt, the project name is also accessible
-# with ${CMAKE_PROJECT_NAME} (both CMake variables are in-sync within the top level
-# build script scope).
+# 设置编译选项 - 针对NDK 21优化
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -std=c++11 -O2")
+
+# Android API 级别检查 - 支持API 21+
+if("${ANDROID_PLATFORM}" STREQUAL "")
+    set(ANDROID_PLATFORM "android-21")
+endif()
+string(REPLACE "android-" "" ANDROID_PLATFORM_LEVEL ${ANDROID_PLATFORM})
+if(ANDROID_PLATFORM_LEVEL LESS 21)
+    message(FATAL_ERROR "Minimum Android API level required is 21")
+endif()
+message(STATUS "Using Android API level: ${ANDROID_PLATFORM_LEVEL}")
+
+# Declares the project name
 project("CompileFfmpeg")
 
-# 设置FFmpeg路径（支持多种方式） 
-# 方式1：项目根目录下的ffmpeg-6.1.1编译结果
-set(FFMPEG_ROOT_DIR ${CMAKE_SOURCE_DIR}/../../../../ffmpeg-6.1.1)
-set(FFMPEG_INCLUDE_DIR ${FFMPEG_ROOT_DIR}/app/src/main/cpp/ffmpeg/${ANDROID_ABI}/include)
-set(FFMPEG_LIBS_DIR ${FFMPEG_ROOT_DIR}/app/src/main/cpp/ffmpeg/${ANDROID_ABI}/lib)
+# NDK版本检查和优化
+message(STATUS "NDK Version: ${ANDROID_NDK_REVISION}")
+message(STATUS "Android ABI: ${ANDROID_ABI}")
+message(STATUS "Android Platform: ${ANDROID_PLATFORM}")
 
-# 方式2：cpp目录下的ffmpeg目录
-set(LOCAL_FFMPEG_DIR ${CMAKE_SOURCE_DIR}/ffmpeg)
-set(LOCAL_FFMPEG_INCLUDE_DIR ${LOCAL_FFMPEG_DIR}/${ANDROID_ABI}/include)
-set(LOCAL_FFMPEG_LIBS_DIR ${LOCAL_FFMPEG_DIR}/${ANDROID_ABI}/lib)
+# 设置FFmpeg路径
+set(FFMPEG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg/${ANDROID_ABI})
+set(FFMPEG_INCLUDE_DIR ${FFMPEG_DIR}/include)
+set(FFMPEG_LIB_DIR ${FFMPEG_DIR}/lib)
+set(FFMPEG_SO_PATH ${FFMPEG_LIB_DIR}/libffmpeg.so)
 
-# 方式3：jniLibs目录（预编译库）
-set(JNI_LIBS_DIR ${CMAKE_SOURCE_DIR}/../../../libs/${ANDROID_ABI})
+# 检查FFmpeg库和头文件
+message(STATUS "Looking for FFmpeg in: ${FFMPEG_DIR}")
+message(STATUS "Include dir: ${FFMPEG_INCLUDE_DIR}")
+message(STATUS "Lib dir: ${FFMPEG_LIB_DIR}")
+message(STATUS "SO path: ${FFMPEG_SO_PATH}")
 
-message(STATUS "Looking for FFmpeg libraries for ${ANDROID_ABI}")
-message(STATUS "JNI_LIBS_DIR: ${JNI_LIBS_DIR}")
-message(STATUS "FFMPEG_INCLUDE_DIR: ${FFMPEG_INCLUDE_DIR}")
-message(STATUS "LOCAL_FFMPEG_INCLUDE_DIR: ${LOCAL_FFMPEG_INCLUDE_DIR}")
-
-# 检查预编译库 + 根目录头文件的组合（推荐方式）
-if(EXISTS ${JNI_LIBS_DIR}/libffmpeg.so AND EXISTS ${FFMPEG_INCLUDE_DIR})
-    # 使用jniLibs中的预编译FFmpeg库 + 根目录的头文件
-    add_library(ffmpeg SHARED IMPORTED)
-    set_target_properties(ffmpeg PROPERTIES IMPORTED_LOCATION ${JNI_LIBS_DIR}/libffmpeg.so)
+if(EXISTS ${FFMPEG_INCLUDE_DIR} AND EXISTS ${FFMPEG_SO_PATH})
+    message(STATUS "✅ Found FFmpeg in ${FFMPEG_DIR}")
     
-    # 添加头文件目录
+    # 添加头文件路径
     include_directories(${FFMPEG_INCLUDE_DIR})
     
-    message(STATUS "✅ Found precompiled FFmpeg library in jniLibs + headers in ffmpeg-6.1.1")
-    set(FFMPEG_LIBRARIES ffmpeg)
-    add_definitions(-DFFMPEG_FOUND=1)
-    
-    # 确保FFmpeg库被安装到APK中
-    set_target_properties(ffmpeg PROPERTIES
-        IMPORTED_LOCATION ${JNI_LIBS_DIR}/libffmpeg.so
-        IMPORTED_NO_SONAME ON)
-
-# 检查本地cpp目录的完整FFmpeg
-elseif(EXISTS ${LOCAL_FFMPEG_INCLUDE_DIR})
-    include_directories(${LOCAL_FFMPEG_INCLUDE_DIR})
-    
-    # 检查是否有合并的FFmpeg库
-    if(EXISTS ${LOCAL_FFMPEG_LIBS_DIR}/libffmpeg.so)
-        add_library(ffmpeg SHARED IMPORTED)
-        set_target_properties(ffmpeg PROPERTIES IMPORTED_LOCATION ${LOCAL_FFMPEG_LIBS_DIR}/libffmpeg.so)
-        set(FFMPEG_LIBRARIES ffmpeg)
-        message(STATUS "✅ Found merged FFmpeg library in cpp/ffmpeg")
-    else()
-        # 使用分离的FFmpeg库
-        if(EXISTS ${LOCAL_FFMPEG_LIBS_DIR}/libavcodec.so)
-            add_library(avcodec SHARED IMPORTED)
-            set_target_properties(avcodec PROPERTIES IMPORTED_LOCATION ${LOCAL_FFMPEG_LIBS_DIR}/libavcodec.so)
-            
-            add_library(avformat SHARED IMPORTED)
-            set_target_properties(avformat PROPERTIES IMPORTED_LOCATION ${LOCAL_FFMPEG_LIBS_DIR}/libavformat.so)
-            
-            add_library(avutil SHARED IMPORTED)
-            set_target_properties(avutil PROPERTIES IMPORTED_LOCATION ${LOCAL_FFMPEG_LIBS_DIR}/libavutil.so)
-            
-            add_library(swresample SHARED IMPORTED)
-            set_target_properties(swresample PROPERTIES IMPORTED_LOCATION ${LOCAL_FFMPEG_LIBS_DIR}/libswresample.so)
-            
-            set(FFMPEG_LIBRARIES avcodec avformat avutil swresample)
-            message(STATUS "✅ Found separate FFmpeg libraries in cpp/ffmpeg")
-        endif()
-    endif()
-    
-    add_definitions(-DFFMPEG_FOUND=1)
-
-# 最后尝试仅使用预编译库（无头文件）
-elseif(EXISTS ${JNI_LIBS_DIR}/libffmpeg.so)
+    # 导入FFmpeg库（作为PRIVATE依赖）
     add_library(ffmpeg SHARED IMPORTED)
-    set_target_properties(ffmpeg PROPERTIES IMPORTED_LOCATION ${JNI_LIBS_DIR}/libffmpeg.so)
-    set(FFMPEG_LIBRARIES ffmpeg)
-    add_definitions(-DFFMPEG_FOUND=1)
-    message(STATUS "⚠️  Found FFmpeg library but no headers - some features may not work")
-
+    set_target_properties(ffmpeg PROPERTIES
+        IMPORTED_LOCATION ${FFMPEG_SO_PATH}
+        IMPORTED_SONAME "libffmpeg.so"
+        INTERFACE_INCLUDE_DIRECTORIES ${FFMPEG_INCLUDE_DIR})
+    
+    # 确保FFmpeg库被包含在APK中
+    set_target_properties(ffmpeg PROPERTIES
+        IMPORTED_NO_SONAME TRUE)
+    
+    # 验证库文件大小（基本健康检查）
+    file(SIZE ${FFMPEG_SO_PATH} FFMPEG_LIB_SIZE)
+    if(FFMPEG_LIB_SIZE GREATER 500000)  # 至少500KB
+        message(STATUS "✅ FFmpeg library size: ${FFMPEG_LIB_SIZE} bytes")
+    set(FFMPEG_FOUND TRUE)
+    else()
+        message(WARNING "❌ FFmpeg library seems too small: ${FFMPEG_LIB_SIZE} bytes")
+        set(FFMPEG_FOUND FALSE)
+    endif()
 else()
-    message(WARNING "❌ FFmpeg not found for ${ANDROID_ABI}")
-    message(WARNING "Please ensure either:")
-    message(WARNING "1. Compiled libraries in cpp/ffmpeg/${ANDROID_ABI}/")
-    message(WARNING "2. Precompiled .so files in libs/${ANDROID_ABI}/")
-    message(WARNING "3. Header files in appropriate include directories")
-    add_definitions(-DFFMPEG_FOUND=0)
+    message(WARNING "❌ FFmpeg not found in ${FFMPEG_DIR}")
+    message(STATUS "Include dir exists: ${EXISTS ${FFMPEG_INCLUDE_DIR}}")
+    message(STATUS "SO file exists: ${EXISTS ${FFMPEG_SO_PATH}}")
+    set(FFMPEG_FOUND FALSE)
 endif()
 
-# Creates and names a library, sets it as either STATIC
-# or SHARED, and provides the relative paths to its source code.
-# You can define multiple libraries, and CMake builds them for you.
-# Gradle automatically packages shared libraries with your APK.
-#
-# In this top level CMakeLists.txt, ${CMAKE_PROJECT_NAME} is used to define
-# the target library name; in the sub-module's CMakeLists.txt, ${PROJECT_NAME}
-# is preferred for the same purpose.
-#
-# In order to load a library into your app from Java/Kotlin, you must call
-# System.loadLibrary() and pass the name of the library defined here;
-# for GameActivity/NativeActivity derived applications, the same library name must be
-# used in the AndroidManifest.xml file.
+# 创建主库 CompileFfmpeg.so
 add_library(${CMAKE_PROJECT_NAME} SHARED
-        # List C/C++ source files with relative paths to this CMakeLists.txt.
-        ffmpeg_wrapper.cpp)
+    ffmpeg_wrapper.cpp)
 
-# Specifies libraries CMake should link to your target library.
-if(DEFINED FFMPEG_LIBRARIES)
-    target_link_libraries(${CMAKE_PROJECT_NAME}
-            # Android system libraries first
-            android
-            log
-            z
-            m
-            dl
-            c++_shared
-            # FFmpeg libraries after system libraries
-            ${FFMPEG_LIBRARIES})
-    message(STATUS "✅ Linking with FFmpeg libraries: ${FFMPEG_LIBRARIES}")
+# 设置编译定义
+if(FFMPEG_FOUND)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE FFMPEG_FOUND=1)
 else()
-    target_link_libraries(${CMAKE_PROJECT_NAME}
-            # Basic Android libraries only
-            android
-            log
-            c++_shared)
-    message(STATUS "⚠️  Linking without FFmpeg libraries")
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE FFMPEG_FOUND=0)
+endif()
+
+# 设置目标属性
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES
+    CXX_STANDARD 11
+    CXX_STANDARD_REQUIRED ON)
+
+# 链接库 - 新的架构设计
+if(FFMPEG_FOUND)
+    message(STATUS "✅ Linking with FFmpeg and system libraries")
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+        # FFmpeg库（作为PRIVATE依赖）
+        ffmpeg
+        # Android系统库（处理ANativeWindow等系统功能）
+        android
+        mediandk
+        log
+        z
+        m
+        dl
+        # 其他系统库
+        OpenSLES
+        c++_shared  # 修改为 c++_shared 以匹配 FFmpeg 的依赖
+        atomic)
+else()
+    message(STATUS "⚠️  Building without FFmpeg support")
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+        android
+        log
+        c++_shared)  # 修改为 c++_shared
+endif()
+
+# 构建后验证和库复制
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "✅ Build completed successfully"
+    COMMAND ${CMAKE_COMMAND} -E echo "📁 Output: $<TARGET_FILE:${CMAKE_PROJECT_NAME}>"
+    COMMENT "Build verification"
+)
+
+# 如果找到FFmpeg，确保库文件被复制到输出目录
+if(FFMPEG_FOUND)
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${FFMPEG_SO_PATH}
+        $<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/libffmpeg.so
+        COMMENT "Copying FFmpeg library to output directory"
+    )
 endif()
