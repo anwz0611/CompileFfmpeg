@@ -317,15 +317,19 @@ public class MainActivity extends AppCompatActivity {
         // 重置性能统计
         resetPerformanceStats();
         
-        logMessage("⚡ 开始延迟测试");
+        // 刷新缓冲区以确保超低延迟
+        flushBuffers();
+        
+        logMessage("⚡ 开始超低延迟测试");
         logMessage("🔄 性能统计已重置");
+        logMessage("🚀 缓冲区已刷新，启动超低延迟模式");
         updateButtonStates();
         
         // 启动性能监控
         performanceMonitor.startMonitoring();
         
-        // 开始帧处理循环
-        startFrameProcessingLoop();
+        // 开始优化的帧处理循环
+        startOptimizedFrameProcessingLoop();
     }
     
     private void stopLatencyTest() {
@@ -336,57 +340,130 @@ public class MainActivity extends AppCompatActivity {
         final int finalFrameCount = frameCount;
         
         runOnUiThread(() -> {
-            logMessage("⏹️ 延迟测试已停止");
+            logMessage("⏹️ 超低延迟测试已停止");
             updateButtonStates();
             
             // 显示测试结果摘要
             long totalTime = System.currentTimeMillis() - finalTestStartTime;
             float avgFps = finalFrameCount * 1000.0f / totalTime;
             
-            String summary = String.format("📊 测试摘要:\n总时长: %d秒\n总帧数: %d\n平均帧率: %.1f FPS", 
+            String summary = String.format("📊 超低延迟测试摘要:\n总时长: %d秒\n总帧数: %d\n平均帧率: %.1f FPS", 
                     totalTime / 1000, finalFrameCount, avgFps);
             logMessage(summary);
             
             // 显示详细性能统计
             String nativeStats = getPerformanceStats();
-            logMessage("\n" + nativeStats);
+            logMessage("📈 详细性能统计:\n" + nativeStats);
+            
+            // 获取native层的精确统计
+            long avgDecodeTime = getAverageDecodeTime();
+            int processedFrames = getProcessedFrameCount();
+            
+            if (processedFrames > 0) {
+                logMessage(String.format("🎯 Native层统计: 已处理%d帧, 平均解码时间%dms", 
+                        processedFrames, avgDecodeTime));
+                
+                // 评估延迟性能
+                String performance;
+                if (avgDecodeTime < 10) {
+                    performance = "🟢 优秀 (超低延迟)";
+                } else if (avgDecodeTime < 20) {
+                    performance = "🟡 良好 (低延迟)";
+                } else if (avgDecodeTime < 50) {
+                    performance = "🟠 一般 (中等延迟)";
+                } else {
+                    performance = "🔴 较差 (高延迟)";
+                }
+                
+                logMessage("🏆 延迟性能评级: " + performance);
+            }
         });
     }
     
-    private void startFrameProcessingLoop() {
+    private void startOptimizedFrameProcessingLoop() {
         executorService.execute(() -> {
+            runOnUiThread(() -> logMessage("🎯 启动超低延迟帧处理循环"));
+            
+            long lastStatsTime = System.currentTimeMillis();
+            int processedFrames = 0;
+            int failedFrames = 0;
+            long totalProcessTime = 0;
+            
             while (isTesting && isConnected) {
-                long frameStart = System.currentTimeMillis();
+                long frameStart = System.nanoTime();
                 
                 boolean success = rtspPlayer.processRtspFrame();
-                if (!success) {
-                    runOnUiThread(() -> logMessage("⚠️ 帧处理失败"));
-                    break;
-                }
                 
-                long frameTime = System.currentTimeMillis() - frameStart;
+                long frameTime = (System.nanoTime() - frameStart) / 1_000_000; // 转换为毫秒
+                totalProcessTime += frameTime;
                 
-                // 更新性能数据
-                if (performanceMonitor != null) {
-                    performanceMonitor.recordDecodeTime(frameTime);
-                }
-                
-                // 动态睡眠时间：根据帧处理时间调整
-                long sleepTime;
-                if (frameTime < 5) {
-                    sleepTime = 8;  // 处理很快，稍微休息
-                } else if (frameTime < 15) {
-                    sleepTime = 5;  // 处理中等，少休息
+                if (success) {
+                    processedFrames++;
+                    
+                    // 更新性能数据
+                    if (performanceMonitor != null) {
+                        performanceMonitor.recordDecodeTime(frameTime);
+                    }
                 } else {
-                    sleepTime = 1;  // 处理较慢，几乎不休息
+                    failedFrames++;
+                    
+                    // 连续失败处理
+                    if (failedFrames > 10) {
+                        runOnUiThread(() -> {
+                            logMessage("❌ 连续帧处理失败，停止测试");
+                            stopLatencyTest();
+                        });
+                        break;
+                    }
+                }
+                
+                // 每5秒输出一次详细统计
+                long currentTime = System.currentTimeMillis();
+                if (currentTime - lastStatsTime >= 5000) {
+                    final int frames = processedFrames;
+                    final int failed = failedFrames;
+                    final long avgTime = frames > 0 ? totalProcessTime / frames : 0;
+                    final float fps = frames * 1000.0f / (currentTime - lastStatsTime);
+                    
+                    runOnUiThread(() -> {
+                        logMessage(String.format("📊 5秒统计: 处理%d帧, 失败%d帧, 平均耗时%dms, FPS=%.1f", 
+                                frames, failed, avgTime, fps));
+                    });
+                    
+                    // 重置计数器
+                    lastStatsTime = currentTime;
+                    processedFrames = 0;
+                    failedFrames = 0;
+                    totalProcessTime = 0;
+                }
+                
+                // 超低延迟优化：动态调整处理间隔
+                long sleepTime;
+                if (frameTime < 3) {
+                    sleepTime = 1;  // 处理很快，最小间隔
+                } else if (frameTime < 10) {
+                    sleepTime = 2;  // 处理中等，短间隔
+                } else if (frameTime < 20) {
+                    sleepTime = 5;  // 处理较慢，中等间隔
+                } else {
+                    sleepTime = 8;  // 处理很慢，较长间隔
+                    
+                    // 处理时间过长时刷新缓冲区
+                    if (frameTime > 50) {
+                        flushBuffers();
+                        runOnUiThread(() -> logMessage("⚡ 检测到高延迟，已刷新缓冲区"));
+                    }
                 }
                 
                 try {
                     Thread.sleep(sleepTime);
                 } catch (InterruptedException e) {
+                    runOnUiThread(() -> logMessage("🔄 帧处理循环被中断"));
                     break;
                 }
             }
+            
+            runOnUiThread(() -> logMessage("⏹️ 帧处理循环已结束"));
         });
     }
     
@@ -617,9 +694,12 @@ public class MainActivity extends AppCompatActivity {
                 tvTotalLatency.setTextColor(color);
                 
                 // 记录详细性能信息到日志
-                if (nativeFrameCount > 0 && nativeFrameCount % 60 == 0) { // 每60帧记录一次
-                    logMessage(String.format("📊 性能: FPS=%.1f, 解码=%dms, 网络=%dms, 总计=%dms (已处理%d帧)",
-                        fps, actualDecodeLatency, networkLatency, totalLatency, nativeFrameCount));
+                if (nativeFrameCount > 0 && nativeFrameCount % 100 == 0) { // 每100帧记录一次
+                    // 获取丢帧统计
+                    String stats = getPerformanceStats();
+                    logMessage(String.format("📊 实时性能: FPS=%.1f, 解码=%dms, 网络=%dms, 总计=%dms", 
+                        fps, actualDecodeLatency, networkLatency, totalLatency));
+                    logMessage("📈 " + stats);
                 }
             });
             
@@ -755,6 +835,11 @@ public class MainActivity extends AppCompatActivity {
      */
     public native int getProcessedFrameCount();
 
+    /**
+     * 刷新解码器缓冲区，用于网络抖动后快速恢复超低延迟
+     */
+    public native void flushBuffers();
+    
     /**
      * 设置视频输出的Surface
      * @param surface Surface对象，用于显示视频
