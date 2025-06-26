@@ -34,6 +34,14 @@ extern "C" {
 #endif
 
 // ============================================================================
+// 全局渲染状态控制 - 解决Surface生命周期同步问题
+// ============================================================================
+static std::atomic<bool> g_surface_valid(false);           // Surface是否有效
+static std::atomic<bool> g_rendering_paused(false);        // 渲染是否暂停
+static std::mutex g_surface_sync_mutex;                    // Surface同步锁
+static std::chrono::steady_clock::time_point g_last_surface_change; // 上次Surface变化时间
+
+// ============================================================================
 // 超低延迟播放核心模块 - 独立封装，不允许外部修改
 // ============================================================================
 #if FFMPEG_FOUND
@@ -638,39 +646,66 @@ public:
         cleanup();
     }
     
-    // 设置渲染目标
+    // 设置渲染目标 - 增强稳定性版本
     bool setSurface(ANativeWindow* window) {
         std::lock_guard<std::mutex> lock(render_mutex);
+        std::lock_guard<std::mutex> sync_lock(g_surface_sync_mutex);
         
+        // 暂停渲染，确保线程安全
+        g_rendering_paused = true;
+        g_surface_valid = false;
+        
+        // 等待当前渲染完成（最多等待33ms，确保超低延迟）
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        
+        // 安全释放旧资源
         if (native_window) {
             ANativeWindow_release(native_window);
+            native_window = nullptr;
         }
         
-        native_window = window;
-        
-        // 清理旧的SwsContext，强制重建
+        // 强制重建SwsContext，避免状态不一致
         if (sws_ctx) {
             sws_freeContext(sws_ctx);
             sws_ctx = nullptr;
             cached_src_width = 0;
+            cached_src_height = 0;
+            cached_src_format = AV_PIX_FMT_NONE;
         }
         
+        // 设置新Surface
+        native_window = window;
+        g_last_surface_change = std::chrono::steady_clock::now();
+        
         if (native_window) {
-            LOGI("✅ 渲染器Surface设置成功");
+            g_surface_valid = true;
+            g_rendering_paused = false;
+            LOGI("✅ 渲染器Surface设置成功，恢复渲染");
             return true;
         } else {
-            LOGI("🧹 渲染器Surface已清理");
+            LOGI("🧹 渲染器Surface已清理，保持暂停状态");
             return true;
         }
     }
     
-    // 渲染帧 - 核心渲染逻辑
+    // 渲染帧 - 核心渲染逻辑（增强稳定性）
     bool renderFrame(AVFrame* frame) {
+        // 第一层检查：基本参数有效性
         if (!frame || !native_window) {
             return false;
         }
         
+        // 第二层检查：Surface状态同步
+        if (!g_surface_valid || g_rendering_paused) {
+            return false; // 快速返回，保持超低延迟
+        }
+        
         std::lock_guard<std::mutex> lock(render_mutex);
+        
+        // 第三层检查：再次验证资源有效性（防止竞态条件）
+        if (!native_window || !g_surface_valid) {
+            return false;
+        }
         
         // 帧率控制
         auto now = std::chrono::steady_clock::now();
@@ -724,11 +759,26 @@ public:
     }
     
 private:
-    // 软件渲染实现
+    // 软件渲染实现（增强稳定性）
     bool renderFrameSoftware(AVFrame* frame) {
-        // 设置缓冲区格式
+        // 关键安全检查：确保渲染资源有效
+        if (!native_window || !g_surface_valid || g_rendering_paused) {
+            LOGW("⚠️ 渲染资源无效，跳过此帧: native_window=%p, valid=%d, paused=%d", 
+                 native_window, (int)g_surface_valid, (int)g_rendering_paused);
+            return false;
+        }
+        
+        // 检查Surface变化时间，避免过于频繁的重建
+        auto now = std::chrono::steady_clock::now();
+        auto surface_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - g_last_surface_change).count();
+        if (surface_age < 50) { // Surface创建后50ms内暂缓渲染，确保稳定
+            return false;
+        }
+        
+        // 设置缓冲区格式（每次Surface变化后重新设置）
         static bool format_set = false;
-        if (!format_set) {
+        if (!format_set || surface_age < 100) {
             int ret = ANativeWindow_setBuffersGeometry(native_window, 
                 frame->width, frame->height, WINDOW_FORMAT_RGBA_8888);
             if (ret != 0) {
@@ -746,7 +796,12 @@ private:
             return false;
         }
         
-        // 锁定Surface
+        // 锁定Surface前再次检查有效性
+        if (!g_surface_valid || !native_window) {
+            LOGW("⚠️ Surface在锁定前变为无效");
+            return false;
+        }
+        
         ANativeWindow_Buffer buffer;
         int ret = ANativeWindow_lock(native_window, &buffer, nullptr);
         if (ret != 0) {
@@ -754,7 +809,13 @@ private:
             return false;
         }
         
-        // 执行颜色空间转换
+        // 执行颜色空间转换前的最后检查
+        if (!sws_ctx || !g_surface_valid) {
+            ANativeWindow_unlockAndPost(native_window); // 确保解锁
+            LOGW("⚠️ SwsContext或Surface在转换前失效");
+            return false;
+        }
+        
         uint8_t* dst_data[4] = {(uint8_t*)buffer.bits, nullptr, nullptr, nullptr};
         int dst_linesize[4] = {buffer.stride * 4, 0, 0, 0};
         
@@ -2187,17 +2248,30 @@ Java_com_jxj_CompileFfmpeg_MainActivity_setSurface(JNIEnv *env, jobject /* thiz 
         native_window = ANativeWindow_fromSurface(env, surface);
         if (!native_window) {
             LOGE("❌ 无法从Surface创建ANativeWindow");
+            // 确保状态一致
+            g_surface_valid = false;
+            g_rendering_paused = true;
             return;
         }
         LOGI("✅ ANativeWindow创建成功: %p", native_window);
+    } else {
+        LOGI("🧹 清理Surface，暂停渲染");
+        g_surface_valid = false;
+        g_rendering_paused = true;
     }
 
     // 设置渲染器Surface
     bool success = g_renderer->setSurface(native_window);
     if (success) {
-        LOGI("✅ 超低延迟渲染器Surface设置成功");
+        if (surface) {
+            LOGI("✅ 超低延迟渲染器Surface设置成功");
+        } else {
+            LOGI("✅ 超低延迟渲染器Surface清理成功");
+        }
     } else {
-        LOGE("❌ 超低延迟渲染器Surface设置失败");
+        LOGE("❌ 超低延迟渲染器Surface操作失败");
+        g_surface_valid = false;
+        g_rendering_paused = true;
     }
 }
 

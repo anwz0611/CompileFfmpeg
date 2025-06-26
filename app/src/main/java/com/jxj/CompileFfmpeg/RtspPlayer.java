@@ -64,8 +64,16 @@ public class RtspPlayer implements SurfaceHolder.Callback {
     public void surfaceCreated(SurfaceHolder holder) {
         Log.d(TAG, "🔄 surfaceCreated: " + holder.getSurface());
         this.surface = holder.getSurface();
+        
+        // 延迟设置Surface，确保系统完全准备就绪
         if (mainActivity != null && surface != null && surface.isValid()) {
-            mainActivity.setSurface(surface);
+            // 使用Handler延迟50ms设置，避免Surface状态不稳定
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                if (surface != null && surface.isValid()) {
+                    mainActivity.setSurface(surface);
+                    Log.d(TAG, "✅ Surface延迟设置完成");
+                }
+            }, 50);
         }
     }
 
@@ -87,10 +95,15 @@ public class RtspPlayer implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        this.surface = null;
+        Log.d(TAG, "🔄 surfaceDestroyed: 立即清理Surface");
+        
+        // 立即清理Surface，确保Native层停止渲染
         if (mainActivity != null) {
             mainActivity.setSurface(null);
         }
+        this.surface = null;
+        
+        Log.d(TAG, "✅ Surface销毁完成");
     }
 
     public void setVideoSize(int width, int height) {
