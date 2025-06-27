@@ -5,11 +5,15 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import android.Manifest;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.format.DateFormat;
 import android.util.Log;
 import android.view.View;
@@ -60,6 +64,7 @@ public class MainActivity extends AppCompatActivity {
 
     private ActivityMainBinding binding;
     private static final int PERMISSION_REQUEST_CODE = 1;
+    private static final int MANAGE_EXTERNAL_STORAGE_REQUEST_CODE = 2;
     
     // UI 组件
     private EditText etRtspUrl;
@@ -105,20 +110,73 @@ public class MainActivity extends AppCompatActivity {
         
         // 初始化RTSP播放器
         initializeRtspPlayer();
+        
+        // 显示初始权限状态
+        logPermissionStatus();
+    }
+    
+    private void logPermissionStatus() {
+        logMessage("🔐 权限状态检查:");
+        logMessage("📱 Android版本: " + Build.VERSION.SDK_INT);
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            boolean hasManageStorage = Environment.isExternalStorageManager();
+            logMessage("📁 文件管理权限: " + (hasManageStorage ? "✅ 已授予" : "❌ 未授予"));
+        }
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            boolean hasMediaVideo = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED;
+            boolean hasMediaAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED;
+            logMessage("🎥 媒体视频权限: " + (hasMediaVideo ? "✅ 已授予" : "❌ 未授予"));
+            logMessage("🎵 媒体音频权限: " + (hasMediaAudio ? "✅ 已授予" : "❌ 未授予"));
+        } else {
+            boolean hasReadStorage = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+            boolean hasWriteStorage = ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+            logMessage("📖 读取存储权限: " + (hasReadStorage ? "✅ 已授予" : "❌ 未授予"));
+            logMessage("✏️ 写入存储权限: " + (hasWriteStorage ? "✅ 已授予" : "❌ 未授予"));
+        }
+        
+        boolean hasInternet = ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET) == PackageManager.PERMISSION_GRANTED;
+        boolean hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+        boolean hasRecordAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        
+        logMessage("🌐 网络权限: " + (hasInternet ? "✅ 已授予" : "❌ 未授予"));
+        logMessage("📷 相机权限: " + (hasCamera ? "✅ 已授予" : "❌ 未授予"));
+        logMessage("🎤 录音权限: " + (hasRecordAudio ? "✅ 已授予" : "❌ 未授予"));
+        
+        logMessage("📊 存储权限综合状态: " + (hasStoragePermission() ? "✅ 可用" : "❌ 不可用"));
     }
 
     private void checkPermissions() {
-        // 检查必要权限
-        String[] permissions = {
-            Manifest.permission.READ_EXTERNAL_STORAGE,
-            Manifest.permission.WRITE_EXTERNAL_STORAGE,
-            Manifest.permission.INTERNET,
-            Manifest.permission.ACCESS_NETWORK_STATE,
-            Manifest.permission.ACCESS_WIFI_STATE
-        };
+        // 检查基本权限
+        String[] basicPermissions;
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ 使用新的媒体权限
+            basicPermissions = new String[]{
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.INTERNET,
+                Manifest.permission.ACCESS_NETWORK_STATE,
+                Manifest.permission.ACCESS_WIFI_STATE,
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.CAMERA
+            };
+        } else {
+            // Android 12及以下使用传统权限
+            basicPermissions = new String[]{
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                Manifest.permission.INTERNET,
+                Manifest.permission.ACCESS_NETWORK_STATE,
+                Manifest.permission.ACCESS_WIFI_STATE,
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.CAMERA
+            };
+        }
         
         boolean needRequest = false;
-        for (String permission : permissions) {
+        for (String permission : basicPermissions) {
             if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
                 needRequest = true;
                 break;
@@ -126,7 +184,37 @@ public class MainActivity extends AppCompatActivity {
         }
         
         if (needRequest) {
-            ActivityCompat.requestPermissions(this, permissions, PERMISSION_REQUEST_CODE);
+            ActivityCompat.requestPermissions(this, basicPermissions, PERMISSION_REQUEST_CODE);
+        }
+        
+        // 检查MANAGE_EXTERNAL_STORAGE权限（Android 11+）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                requestManageExternalStoragePermission();
+            }
+        }
+    }
+    
+    private void requestManageExternalStoragePermission() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            startActivityForResult(intent, MANAGE_EXTERNAL_STORAGE_REQUEST_CODE);
+            
+            Toast.makeText(this, "请允许访问所有文件权限以保存录制视频", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+            startActivityForResult(intent, MANAGE_EXTERNAL_STORAGE_REQUEST_CODE);
+        }
+    }
+    
+    private boolean hasStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED;
+        } else {
+            return ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
         }
     }
 
@@ -293,7 +381,8 @@ public class MainActivity extends AppCompatActivity {
         logMessage("🔄 正在断开连接...");
         
         executorService.execute(() -> {
-            if (isRecording) {
+            if (rtspPlayer.isRecording()) {
+                logMessage("📹 断开连接时检测到录制中，先停止录制");
                 rtspPlayer.stopRecording();
             }
             if (isTesting) {
@@ -473,15 +562,43 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         
-        if (isRecording) {
+        // 使用RtspPlayer的实际状态，而不是MainActivity的缓存状态
+        if (rtspPlayer.isRecording()) {
+            logMessage("📹 停止录制按钮被点击，当前RtspPlayer状态: " + rtspPlayer.isRecording());
             // 停止录制
             rtspPlayer.stopRecording();
         } else {
-            // 开始录制
-            File storage = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-            final String outputPath =  storage.getAbsolutePath() + "/record" +
-                              "/rtsp_record_" + System.currentTimeMillis() + ".mp4";
+            // 检查存储权限
+            if (!hasStoragePermission()) {
+                Toast.makeText(this, "需要存储权限才能录制视频", Toast.LENGTH_LONG).show();
+                logMessage("⚠️ 录制失败：缺少存储权限");
+                checkPermissions(); // 重新请求权限
+                return;
+            }
             
+            // 创建录制目录
+            File storage = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+            if (storage == null) {
+                // 尝试使用公共目录
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+                    storage = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "CompileFfmpeg");
+                } else {
+                    storage = new File(getExternalFilesDir(null), "Movies");
+                }
+            }
+            
+            File recordDir = new File(storage, "record");
+            if (!recordDir.exists() && !recordDir.mkdirs()) {
+                Toast.makeText(this, "无法创建录制目录", Toast.LENGTH_SHORT).show();
+                logMessage("❌ 无法创建录制目录: " + recordDir.getAbsolutePath());
+                return;
+            }
+            
+            // 生成录制文件名（MP4格式）
+            String timestamp = DateFormat.format("yyyyMMdd_HHmmss", new Date()).toString();
+            final String outputPath = recordDir.getAbsolutePath() + "/rtsp_record_" + timestamp + ".mp4";
+            
+            logMessage("📁 录制文件路径: " + outputPath);
             rtspPlayer.startRecording(outputPath);
         }
     }
@@ -507,13 +624,16 @@ public class MainActivity extends AppCompatActivity {
         btnRecord.setEnabled(isConnected);
         btnDisconnect.setEnabled(isConnected);
         
-        btnRecord.setText(isRecording ? "停止录制" : "开始录制");
+        // 使用RtspPlayer的实际录制状态
+        boolean actualRecordingState = rtspPlayer != null && rtspPlayer.isRecording();
+        btnRecord.setText(actualRecordingState ? "停止录制" : "开始录制");
         btnStartTest.setText(isTesting ? "测试中..." : "开始测试");
     }
     
     private void updateDecoderInfo() {
         String decoderInfo = getDecoderInfo();
-        tvDecoderInfo.setText("解码器: " + decoderInfo);
+        String permissionStatus = hasStoragePermission() ? "✅" : "❌";
+        tvDecoderInfo.setText("解码器: " + decoderInfo + " | 存储权限: " + permissionStatus);
     }
     
     private void resetPerformanceDisplay() {
@@ -587,10 +707,42 @@ public class MainActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "权限已获取", Toast.LENGTH_SHORT).show();
+            boolean allGranted = true;
+            StringBuilder deniedPermissions = new StringBuilder();
+            
+            for (int i = 0; i < permissions.length; i++) {
+                if (grantResults[i] != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    if (deniedPermissions.length() > 0) {
+                        deniedPermissions.append(", ");
+                    }
+                    deniedPermissions.append(permissions[i]);
+                }
+            }
+            
+            if (!allGranted) {
+                String message = "以下权限被拒绝，可能影响应用功能：\n" + deniedPermissions.toString();
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+                logMessage("⚠️ 权限被拒绝: " + deniedPermissions.toString());
             } else {
-                Toast.makeText(this, "需要存储权限来访问视频文件", Toast.LENGTH_LONG).show();
+                logMessage("✅ 所有权限已授予");
+                Toast.makeText(this, "权限已获取", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+    
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == MANAGE_EXTERNAL_STORAGE_REQUEST_CODE) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (Environment.isExternalStorageManager()) {
+                    logMessage("✅ 文件管理权限已授予");
+                    Toast.makeText(this, "文件管理权限已授予", Toast.LENGTH_SHORT).show();
+                } else {
+                    logMessage("⚠️ 文件管理权限被拒绝，录制功能可能受限");
+                    Toast.makeText(this, "文件管理权限被拒绝，录制功能可能受限", Toast.LENGTH_LONG).show();
+                }
             }
         }
     }
@@ -761,6 +913,13 @@ public class MainActivity extends AppCompatActivity {
      * @return RTSP流的详细信息
      */
     public native String getRtspStreamInfo();
+    
+    /**
+     * 准备录制环境
+     * @param outputPath 输出文件路径
+     * @return 是否成功准备
+     */
+    public native boolean prepareRecording(String outputPath);
     
     /**
      * 开始录制RTSP流

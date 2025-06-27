@@ -62,16 +62,12 @@ public class RtspPlayer implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        Log.d(TAG, "🔄 surfaceCreated: " + holder.getSurface());
         this.surface = holder.getSurface();
         
-        // 延迟设置Surface，确保系统完全准备就绪
         if (mainActivity != null && surface != null && surface.isValid()) {
-            // 使用Handler延迟50ms设置，避免Surface状态不稳定
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 if (surface != null && surface.isValid()) {
                     mainActivity.setSurface(surface);
-                    Log.d(TAG, "✅ Surface延迟设置完成");
                 }
             }, 50);
         }
@@ -79,31 +75,22 @@ public class RtspPlayer implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        Log.d(TAG, "🔄 surfaceChanged: format=" + format + ", size=" + width + "x" + height);
         Surface newSurface = holder.getSurface();
         
-        // 只有当Surface真正改变时才重新设置
         if (newSurface != this.surface) {
             this.surface = newSurface;
             if (mainActivity != null && surface != null && surface.isValid()) {
                 mainActivity.setSurface(surface);
             }
-        } else {
-            Log.d(TAG, "🔄 Surface未改变，跳过重复设置");
         }
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        Log.d(TAG, "🔄 surfaceDestroyed: 立即清理Surface");
-        
-        // 立即清理Surface，确保Native层停止渲染
         if (mainActivity != null) {
             mainActivity.setSurface(null);
         }
         this.surface = null;
-        
-        Log.d(TAG, "✅ Surface销毁完成");
     }
 
     public void setVideoSize(int width, int height) {
@@ -120,8 +107,6 @@ public class RtspPlayer implements SurfaceHolder.Callback {
      * 打开RTSP流（支持低延迟配置）
      */
     public void openStream(String rtspUrl) {
-        Log.i(TAG, "打开RTSP流: " + rtspUrl);
-        
         new AsyncTask<String, Void, Boolean>() {
             @Override
             protected Boolean doInBackground(String... urls) {
@@ -132,7 +117,6 @@ public class RtspPlayer implements SurfaceHolder.Callback {
             protected void onPostExecute(Boolean success) {
                 if (success) {
                     String streamInfo = mainActivity != null ? mainActivity.getRtspStreamInfo() : "未知";
-                    Log.i(TAG, "RTSP流打开成功: " + streamInfo);
                     
                     isPlaying = true;
                     startFrameProcessing();
@@ -141,7 +125,6 @@ public class RtspPlayer implements SurfaceHolder.Callback {
                         listener.onStreamOpened(streamInfo);
                     }
                 } else {
-                    Log.e(TAG, "RTSP流打开失败");
                     if (listener != null) {
                         listener.onError("无法打开RTSP流: " + rtspUrl);
                     }
@@ -154,81 +137,137 @@ public class RtspPlayer implements SurfaceHolder.Callback {
      * 开始录制
      */
     public void startRecording(String outputPath) {
-        if (!isPlaying) {
-            Log.e(TAG, "RTSP流未打开，无法开始录制");
-            if (listener != null) {
-                listener.onError("RTSP流未打开，无法开始录制");
-            }
+        if (!isPlaying || isRecording) {
             return;
         }
         
-        Log.i(TAG, "开始录制到: " + outputPath);
+        // 创建录制目录和MP4文件
+        java.io.File file = new java.io.File(outputPath);
+        java.io.File parentDir = file.getParentFile();
         
-        new AsyncTask<String, Void, Boolean>() {
-            @Override
-            protected Boolean doInBackground(String... paths) {
-                return mainActivity != null ? mainActivity.startRtspRecording(paths[0]) : false;
+        if (parentDir != null && !parentDir.exists()) {
+            parentDir.mkdirs();
+        }
+        
+        // 简化文件创建，让Native层处理
+        try {
+            if (file.exists()) {
+                file.delete();
             }
             
-            @Override
-            protected void onPostExecute(Boolean success) {
-                if (success) {
-                    isRecording = true;
-                    Log.i(TAG, "录制开始成功");
-                    if (listener != null) {
-                        listener.onRecordingStarted();
+            // 只确保目录存在，不预创建文件
+            // Native层会创建和管理文件
+            
+        } catch (Exception e) {
+            Log.e(TAG, "文件准备失败: " + e.getMessage());
+            return;
+        }
+        
+        new Thread(() -> {
+            try {
+                Log.i(TAG, "🔧 开始录制线程启动");
+                boolean success = false;
+                // 先准备录制环境
+                if (mainActivity != null) {
+                    Log.i(TAG, "🔧 调用prepareRecording");
+                    boolean prepared = mainActivity.prepareRecording(outputPath);
+                    Log.i(TAG, "🔧 prepareRecording结果: " + prepared);
+                    
+                    if (prepared) {
+                        Log.i(TAG, "🔧 调用startRtspRecording");
+                        // 启动录制
+                        boolean started = mainActivity.startRtspRecording(outputPath);
+                        Log.i(TAG, "🔧 startRtspRecording结果: " + started);
+                        if (started) {
+                            success = true;
+                        }
                     }
                 } else {
-                    Log.e(TAG, "录制开始失败");
-                    if (listener != null) {
-                        listener.onError("录制开始失败");
-                    }
+                    Log.e(TAG, "🔧 mainActivity为空");
                 }
+                
+                Log.i(TAG, "🔧 录制准备完成，结果: " + success);
+                
+                // 在主线程更新UI
+                final boolean finalSuccess = success;
+                mainHandler.post(() -> {
+                    if (finalSuccess) {
+                        Log.i(TAG, "🔧 录制启动成功，更新状态");
+                        isRecording = true;
+                        if (listener != null) {
+                            listener.onRecordingStarted();
+                        }
+                    } else {
+                        Log.e(TAG, "🔧 录制启动失败");
+                        if (listener != null) {
+                            listener.onError("录制开始失败");
+                        }
+                    }
+                });
+                
+            } catch (Exception e) {
+                Log.e(TAG, "🔧 录制启动异常: " + e.getMessage(), e);
+                // 在主线程更新UI
+                mainHandler.post(() -> {
+                    if (listener != null) {
+                        listener.onError("录制启动异常: " + e.getMessage());
+                    }
+                });
             }
-        }.execute(outputPath);
+        }).start();
     }
     
-    /**
-     * 停止录制
-     */
     public void stopRecording() {
-        if (!isRecording) {
-            Log.w(TAG, "录制未在进行中");
-            return;
-        }
+        Log.d(TAG, "🔧 stopRecording 被调用，当前状态: " + isRecording);
         
-        Log.i(TAG, "停止录制");
-        
-        new AsyncTask<Void, Void, Boolean>() {
-            @Override
-            protected Boolean doInBackground(Void... voids) {
-                return mainActivity != null ? mainActivity.stopRtspRecording() : false;
-            }
-            
-            @Override
-            protected void onPostExecute(Boolean success) {
-                if (success) {
-                    isRecording = false;
-                    Log.i(TAG, "录制停止成功");
-                    if (listener != null) {
-                        listener.onRecordingStopped();
-                    }
+        // 使用Thread代替AsyncTask，更可靠
+        new Thread(() -> {
+            try {
+                Log.d(TAG, "🔧 停止录制线程启动");
+                Log.d(TAG, "🔧 调用 native stopRtspRecording");
+                
+                boolean result = false;
+                if (mainActivity != null) {
+                    result = mainActivity.stopRtspRecording();
+                    Log.d(TAG, "🔧 native stopRtspRecording 结果: " + result);
                 } else {
-                    Log.e(TAG, "录制停止失败");
-                    if (listener != null) {
-                        listener.onError("录制停止失败");
-                    }
+                    Log.e(TAG, "🔧 mainActivity 为空");
                 }
+                
+                // 在主线程更新UI
+                final boolean finalResult = result;
+                mainHandler.post(() -> {
+                    Log.d(TAG, "🔧 停止录制完成，结果: " + finalResult);
+                    isRecording = false; // 强制设置为false
+                    
+                    if (finalResult) {
+                        if (listener != null) {
+                            listener.onRecordingStopped();
+                        }
+                    } else {
+                        if (listener != null) {
+                            listener.onError("录制停止失败，但已强制停止");
+                        }
+                    }
+                });
+                
+            } catch (Exception e) {
+                Log.e(TAG, "🔧 stopRtspRecording 异常: " + e.getMessage(), e);
+                // 在主线程更新UI
+                mainHandler.post(() -> {
+                    isRecording = false; // 强制设置为false
+                    if (listener != null) {
+                        listener.onError("录制停止异常: " + e.getMessage());
+                    }
+                });
             }
-        }.execute();
+        }).start();
     }
     
     /**
      * 关闭RTSP流
      */
     public void closeStream() {
-        Log.i(TAG, "关闭RTSP流");
-        
         isPlaying = false;
         stopFrameProcessing();
         
@@ -247,7 +286,6 @@ public class RtspPlayer implements SurfaceHolder.Callback {
             
             @Override
             protected void onPostExecute(Void aVoid) {
-                Log.i(TAG, "RTSP流关闭完成");
                 if (listener != null) {
                     listener.onStreamClosed();
                 }
@@ -283,43 +321,33 @@ public class RtspPlayer implements SurfaceHolder.Callback {
     private class FrameProcessTask extends AsyncTask<Void, Void, Void> {
         @Override
         protected Void doInBackground(Void... voids) {
-            Log.i(TAG, "开始帧处理循环");
-            
             while (isPlaying && !isCancelled()) {
                 try {
                     boolean success = mainActivity != null ? mainActivity.processRtspFrame() : false;
                     
                     if (success) {
-                        // 通知主线程处理了一帧
                         mainHandler.post(() -> {
                             if (listener != null) {
                                 listener.onFrameProcessed();
                             }
                         });
                         
-                        // 超低延迟模式：最小休眠时间
-                        Thread.sleep(5); // 最小延迟，让CPU有时间处理其他任务
+                        Thread.sleep(5);
                     } else {
-                        // 处理失败，可能是流结束或出错
-                        Log.w(TAG, "帧处理失败，可能是流结束");
                         break;
                     }
                 } catch (InterruptedException e) {
-                    Log.i(TAG, "帧处理线程被中断");
                     break;
                 } catch (Exception e) {
-                    Log.e(TAG, "帧处理异常: " + e.getMessage());
                     break;
                 }
             }
             
-            Log.i(TAG, "帧处理循环结束");
             return null;
         }
         
         @Override
         protected void onPostExecute(Void aVoid) {
-            // 帧处理结束，可能需要通知UI
             if (listener != null && isPlaying) {
                 listener.onError("RTSP流处理结束");
             }
@@ -347,5 +375,41 @@ public class RtspPlayer implements SurfaceHolder.Callback {
     // 提供给MainActivity调用的方法
     public boolean processRtspFrame() {
         return mainActivity != null ? mainActivity.processRtspFrame() : false;
+    }
+    
+    private boolean writeBasicMp4Header(java.io.File file) {
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(file)) {
+            writeFtypBox(fos);
+            writeMdatBoxHeader(fos);
+            fos.flush();
+            return true;
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+    
+    private void writeFtypBox(java.io.FileOutputStream fos) throws java.io.IOException {
+        writeUInt32BE(fos, 32);           // box大小
+        writeUInt32BE(fos, 0x66747970);   // 'ftyp'
+        writeUInt32BE(fos, 0x69736F6D);   // 'isom'
+        writeUInt32BE(fos, 0x00000200);   // version
+        writeUInt32BE(fos, 0x69736F6D);   // 'isom'
+        writeUInt32BE(fos, 0x69736F32);   // 'iso2'
+        writeUInt32BE(fos, 0x61766331);   // 'avc1'
+        writeUInt32BE(fos, 0x6D703431);   // 'mp41'
+    }
+    
+    private void writeMdatBoxHeader(java.io.FileOutputStream fos) throws java.io.IOException {
+        writeUInt32BE(fos, 8);            // 临时大小
+        writeUInt32BE(fos, 0x6D646174);   // 'mdat'
+    }
+    
+    private void writeUInt32BE(java.io.FileOutputStream fos, int value) throws java.io.IOException {
+        byte[] bytes = new byte[4];
+        bytes[0] = (byte) ((value >> 24) & 0xFF);
+        bytes[1] = (byte) ((value >> 16) & 0xFF);
+        bytes[2] = (byte) ((value >> 8) & 0xFF);
+        bytes[3] = (byte) (value & 0xFF);
+        fos.write(bytes);
     }
 } 
